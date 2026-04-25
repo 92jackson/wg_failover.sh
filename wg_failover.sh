@@ -1,15 +1,14 @@
 #!/bin/sh
-# =============================================================================
-# wg_failover.sh v1.0.0 — WireGuard Tunnel Failover for GL.iNet Routers (OpenWrt)
-# =============================================================================
-# Monitors one or more WireGuard tunnels and automatically switches to the
-# next available peer when the current one goes stale. After switching,
-# verifies the new connection with a ping test routed through the specific
-# tunnel interface before declaring the failover successful.
+# =================================================================================================
+# wg_failover.sh v1.0.0 — WireGuard Tunnel Failover and Auto-Rotate for GL.iNet Routers (OpenWrt)
+# Github: https://github.com/92jackson/wg_failover.sh/
+# License: MIT
+# =================================================================================================
+# 1) Monitors one or more WireGuard tunnels and automatically switches to the
+# next available peer (VPN server config) when the current one becomes unresponsive.
 #
-# A lockfile prevents concurrent cron instances from running simultaneously,
-# which is important since failover runs can exceed 60s.
-#
+# 2) Optional scheduled peer rotation- after a set number of hours, or a specific time of day.
+# =================================================================================================
 # INSTALL:
 #   1. Copy this script to /usr/bin/wg_failover.sh
 #   2. Make executable:  chmod +x /usr/bin/wg_failover.sh
