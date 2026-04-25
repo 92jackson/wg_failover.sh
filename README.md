@@ -147,17 +147,17 @@ uci show wireguard | grep '\.name=' && uci show network | grep ip4table
 ```
 
 ```
-wireguard.peer_100.name='Provider-RegionA-Server1'
-wireguard.peer_101.name='Provider-RegionA-Server2'
-wireguard.peer_102.name='Provider-RegionA-Server3'
-wireguard.peer_103.name='Provider-RegionB-Server1'
-wireguard.peer_104.name='Provider-RegionB-Server2'
+wireguard.peer_100.name='Provider-SetA-Server1'
+wireguard.peer_101.name='Provider-SetA-Server2'
+wireguard.peer_102.name='Provider-SetA-Server3'
+wireguard.peer_103.name='Provider-SetB-Server1'
+wireguard.peer_104.name='Provider-SetB-Server2'
 network.wgclient1.ip4table='1001'
 network.wgclient2.ip4table='1002'
 ```
 
 - The routing table numbers (`1001`, `1002`) are your `TUNNEL_X_ROUTE_TABLE` values- these ensure ping verification is routed through the correct tunnel.
-- Choose a substring present in all the server names you want grouped into each tunnel's failover pool. For example `RegionA` matches all three Region A servers above; `RegionB` matches both Region B servers. These become your `TUNNEL_X_KEYWORD` values. You need at least 2 matching servers per tunnel for failover to be possible.
+- Choose a substring present in all the server names you want grouped into each tunnel's failover pool. For example `SetA` matches all three Set A servers above; `SetB` matches both Set B servers. These become your `TUNNEL_X_KEYWORD` values. You need at least 2 matching servers per tunnel for failover to be possible.
 
 ---
 
@@ -168,21 +168,21 @@ With the values discovered above, edit the tunnel definitions in the script:
 ```bash
 TUNNEL_COUNT=2
 
-# Tunnel 1: Primary VPN- all Region A servers, no rotation
+# Tunnel 1: Primary VPN- all Set A servers, no rotation
 TUNNEL_1_IFACE='wgclient1'
 TUNNEL_1_WG_IF='wgclient1'
-TUNNEL_1_LABEL='Primary (Region A)'
-TUNNEL_1_KEYWORD='RegionA'
+TUNNEL_1_LABEL='Primary (Set A)'
+TUNNEL_1_KEYWORD='SetA'
 TUNNEL_1_ROUTE_TABLE='1001'
 TUNNEL_1_ENABLED=1
 TUNNEL_1_ROTATE_INTERVAL=0
 TUNNEL_1_ROTATE_AT=''
 
-# Tunnel 2: Secondary VPN- all Region B servers, rotates every 6h and at 3am
+# Tunnel 2: Secondary VPN- all Set B servers, rotates every 6h and at 3am
 TUNNEL_2_IFACE='wgclient2'
 TUNNEL_2_WG_IF='wgclient2'
-TUNNEL_2_LABEL='Secondary (Region B)'
-TUNNEL_2_KEYWORD='RegionB'
+TUNNEL_2_LABEL='Secondary (Set B)'
+TUNNEL_2_KEYWORD='SetB'
 TUNNEL_2_ROUTE_TABLE='1002'
 TUNNEL_2_ENABLED=1
 TUNNEL_2_ROTATE_INTERVAL=6
@@ -230,7 +230,7 @@ TUNNEL_1_ROTATE_AT=''
 ```bash
 TUNNEL_COUNT=2
 
-TUNNEL_1_KEYWORD='RegionA'  # Claims all servers whose name contains 'RegionA'
+TUNNEL_1_KEYWORD='SetA'  # Claims all servers whose name contains 'SetA'
 TUNNEL_2_KEYWORD=''         # Gets everything not claimed by any other tunnel
 ```
 
@@ -317,22 +317,22 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 /usr/bin/wg_failover.sh --dry-run
 
 # Trigger a real immediate failover on a specific tunnel
-/usr/bin/wg_failover.sh --fail "Primary (Region A)"
+/usr/bin/wg_failover.sh --fail "Primary (Set A)"
 
 # Dry-run a simulated failure to trace decision logic
-/usr/bin/wg_failover.sh --dry-run --fail "Primary (Region A)"
+/usr/bin/wg_failover.sh --dry-run --fail "Primary (Set A)"
 
 # Trigger a failover but revert to original peer after success (useful for alerting tests)
-/usr/bin/wg_failover.sh --fail "Primary (Region A)" --revert
+/usr/bin/wg_failover.sh --fail "Primary (Set A)" --revert
 
 # Force a failover even if the next candidate is in cooldown
-/usr/bin/wg_failover.sh --fail "Primary (Region A)" --ignore-cooldown
+/usr/bin/wg_failover.sh --fail "Primary (Set A)" --ignore-cooldown
 
 # Run a full end-to-end exercise test on all tunnels
 /usr/bin/wg_failover.sh --exercise
 
 # Exercise a single tunnel
-/usr/bin/wg_failover.sh --exercise "Primary (Region A)"
+/usr/bin/wg_failover.sh --exercise "Primary (Set A)"
 
 # Dry-run an exercise with cooldown bypass
 /usr/bin/wg_failover.sh --dry-run --exercise --ignore-cooldown
@@ -347,28 +347,28 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 ============================================
   Lock: none (no run in progress)
 
-  [1] Primary (Region A)
+  [1] Primary (Set A)
   Interface : wgclient1
-  Active    : Provider-RegionA-Server1 (peer_100)
+  Active    : Provider-SetA-Server1 (peer_100)
   Handshake : OK -- 45s ago
-  Keyword   : 'RegionA'
+  Keyword   : 'SetA'
   Route tbl : 1001
   Peer pool : 3 peers
-    . Provider-RegionA-Server1 (peer_100) [ACTIVE]
-    . Provider-RegionA-Server2 (peer_101)
-    . Provider-RegionA-Server3 (peer_102)
+    . Provider-SetA-Server1 (peer_100) [ACTIVE]
+    . Provider-SetA-Server2 (peer_101)
+    . Provider-SetA-Server3 (peer_102)
   Rotation  : disabled
   Ping test : PASS (1.1.1.1 reachable through tunnel)
 
-  [2] Secondary (Region B)
+  [2] Secondary (Set B)
   Interface : wgclient2
-  Active    : Provider-RegionB-Server1 (peer_103)
+  Active    : Provider-SetB-Server1 (peer_103)
   Handshake : OK -- 89s ago
-  Keyword   : 'RegionB'
+  Keyword   : 'SetB'
   Route tbl : 1002
   Peer pool : 2 peers
-    . Provider-RegionB-Server1 (peer_103) [ACTIVE]
-    . Provider-RegionB-Server2 (peer_104)
+    . Provider-SetB-Server1 (peer_103) [ACTIVE]
+    . Provider-SetB-Server2 (peer_104)
   Rotation  : every 6h or at 03:00 -- last rotated 2024-01-15 08:00 (22932s ago)
   Ping test : PASS (1.1.1.1 reachable through tunnel)
 
@@ -420,9 +420,9 @@ POST payload:
 
 ```json
 {
-  "tunnel": "Primary (Region A)",
-  "from": "Provider-RegionA-Server1",
-  "to": "Provider-RegionA-Server2",
+  "tunnel": "Primary (Set A)",
+  "from": "Provider-SetA-Server1",
+  "to": "Provider-SetA-Server2",
   "status": "switched"
 }
 ```
@@ -430,7 +430,7 @@ POST payload:
 GET equivalent:
 
 ```
-?tunnel=Primary%20(Region%20A)&from=Provider-RegionA-Server1&to=Provider-RegionA-Server2&status=switched
+?tunnel=Primary%20(Set%20A)&from=Provider-SetA-Server1&to=Provider-SetA-Server2&status=switched
 ```
 
 ### Status Values
