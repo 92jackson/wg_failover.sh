@@ -1,71 +1,154 @@
 # wg_failover.sh
 
-**WireGuard VPN Tunnel Failover and Auto-Rotate for GL.iNet Routers (OpenWrt)**
+**WireGuard Tunnel Failover and Auto-Rotation for OpenWrt**
 
-Automatically monitors one or more WireGuard tunnels and switches to the next available server when the current one becomes unresponsive. Supports scheduled server rotation independent of tunnel health.
+Monitors WireGuard tunnels and automatically switches to another server from the pool when the active peer becomes unresponsive. Also supports scheduled server rotation independent of tunnel health.
 
 ---
 
 ## How It Works
 
-WireGuard's "last handshake" timestamp is used to detect a down server — when it goes stale beyond a configurable threshold, the script rotates to the next server in the pool. Before acting, a WAN pre-flight check runs to ensure the issue isn't a local ISP outage. After switching, a ping through the tunnel interface confirms traffic is flowing; if it fails, the next server is tried immediately without waiting for the next cron cycle.
+The script monitors the WireGuard `latest handshake` timestamp to detect a failed server. When it becomes stale, two optional checks run before switching:
 
-Failed servers enter a cooldown period to prevent immediately cycling back to them. Each tunnel is monitored independently, and a lockfile prevents overlapping cron runs during longer failover sequences.
+1. **WAN check** — confirms the ISP connection is up.
+2. **Tunnel ping** — confirms the peer can route traffic. If it succeeds, no switch occurs.
+
+After switching, another tunnel ping verifies connectivity. If it fails, the script immediately tries the next server until a connection is established (or limits are reached).
+
+Failed servers enter a cooldown period to prevent rapid reuse. Tunnels are monitored independently, and a `lockfile` prevents overlapping cron runs during long failover sequences.
 
 ---
 
 ## Features
 
-- **Automatic failover** — Detects stale WireGuard handshakes and switches servers without manual intervention
-- **WAN pre-flight checks** — Suppresses failover during ISP outages so the server pool isn't exhausted unnecessarily
-- **Scheduled rotation** — Rotate to the next server after X hours or at a set time of day, regardless of tunnel health
-- **Ping verification** — Confirms the new server is actually routing traffic after switching, with a primary and fallback target
-- **Per-peer cooldown** — Prevents cycling back to recently failed servers
-- **Switch history** — Persistent per-tunnel log of recent switches with configurable retention
-- **Independent multi-tunnel support** — Monitor multiple WireGuard tunnels, each with their own server pool
-- **Webhook notifications** — Alerts on failover, rotation, and WAN up/down events
-- **Flexible flag interface** — Dry-run, simulated failure, WAN simulation, force-rotate, exercise testing, cooldown bypass, and more
+- **Automatic failover** — Detects stale handshakes and switches servers automatically
+- **Scheduled rotation** — Rotate servers after a set interval or at a specific time of day
+- **Multi-tunnel support** — Independent monitoring and server pools per tunnel
+- **WAN safeguards** — Prevents failover during ISP outages
+- **Post-switch verification** — Confirms traffic routing with primary and fallback ping targets
+- **Per-peer cooldown** — Avoids rapid reuse of recently failed servers
+- **Switch history** — Persistent per-tunnel log with configurable retention
+- **Webhook notifications** — Alerts for failover, rotation, and WAN state changes
+- **GL.iNet dashboard sync** — Optional API integration to keep the router UI in sync after peer switches
 
 ---
 
 ## Compatibility
 
-- GL.iNet firmware 4.x (split-tunnel / VPN policy / dashboard mode)
-- GL.iNet firmware 4.x (global VPN mode — single tunnel, no policies)
-- Any OpenWrt device using UCI WireGuard peer configuration + ubus network control
+- GL.iNet firmware 4.x (policy-based routing and global VPN modes)
+- Any OpenWrt device using UCI WireGuard peer configuration with `ubus` network control
 
-> ⚠️ The GL.iNet web dashboard will likely show incorrect server info after an automated switch. Traffic routing is unaffected. See [Limitations](#limitations).
+> ⚠️ On GL.iNet routers the web dashboard may show incorrect server info after an automated switch unless the optional GL.iNet API integration is enabled. See [Peer Switching Methods](#peer-switching-methods) and [Limitations](#limitations).
 
----
-
-## Prerequisites
-
-- SSH access enabled
-- At least 2 VPN server profiles configured per tunnel
+> _Tested so far on GL.iNet Flint 2 (stock firmware)._
 
 ---
 
 ## Installation
 
-The script must be configured before being activated. Do not add it to cron until you have edited it with your tunnel details.
-
-**Step 1 — Download the script:**
+### Step 1 — Download the script
 
 ```bash
 wget -O /usr/bin/wg_failover.sh https://raw.githubusercontent.com/92jackson/wg_failover.sh/refs/heads/main/wg_failover.sh
 chmod +x /usr/bin/wg_failover.sh
 ```
 
-**Step 2 — Configure the script** (see [Configuration](#configuration) below).
+### Step 2 — Run discovery commands
 
-**Step 3 — Activate via cron:**
+Run the following commands on your router and note the output. You'll need these values for configuration.
+
+#### A) Get the WAN interface
+
+```bash
+ip route show default | awk '{print $5}'
+```
+
+Use the output as `WAN_IFACE`.
+
+#### B) Identify WireGuard tunnel interfaces
+
+```bash
+uci show network | grep 'wgclient.*\.config='
+```
+
+Example output:
+
+```
+network.wgclient1.config='peer_2001'
+network.wgclient2.config='peer_2006'
+```
+
+The interface names (`wgclient1`, `wgclient2`) are used for `TUNNEL_X_IFACE` and `TUNNEL_X_WG_IF`.
+
+#### C) List available VPN servers
+
+```bash
+uci show wireguard | grep '\.name='
+```
+
+Example output:
+
+```
+wireguard.peer_100.name='Provider-SetA-Server1'
+wireguard.peer_101.name='Provider-SetA-Server2'
+wireguard.peer_102.name='Provider-SetA-Server3'
+wireguard.peer_103.name='Provider-SetB-Server1'
+wireguard.peer_104.name='Provider-SetB-Server2'
+```
+
+Choose a keyword (substring) that appears in all servers belonging to a tunnel pool (e.g. `SetA`, `SetB`). Each tunnel requires **at least two matching servers**. These become `TUNNEL_X_KEYWORD`.
+
+#### D) Find routing tables per tunnel
+
+```bash
+uci show network | grep ip4table
+```
+
+Example:
+
+```
+network.wgclient1.ip4table='1001'
+network.wgclient2.ip4table='1002'
+```
+
+Use these values for `TUNNEL_X_ROUTE_TABLE`.
+
+### Step 3 — Configure the script
+
+Edit the script with your gathered values:
+
+```bash
+vi /usr/bin/wg_failover.sh
+```
+
+**Minimum required configuration** (fill in values from Step 2):
+
+```bash
+# WAN
+WAN_IFACE='eth1'                     # From Step 2A
+
+# Tunnel 1
+TUNNEL_COUNT=1
+TUNNEL_1_IFACE='wgclient1'           # From Step 2B
+TUNNEL_1_WG_IF='wgclient1'           # From Step 2B
+TUNNEL_1_LABEL='Primary'             # Friendly name (free text)
+TUNNEL_1_KEYWORD='SetA'              # From Step 2C
+TUNNEL_1_ROUTE_TABLE='1001'          # From Step 2D
+TUNNEL_1_ENABLED=1
+```
+
+See [Configuration Reference](#configuration-reference) for all available options including multiple tunnels, rotation schedules, and GL.iNet API integration.
+
+### Step 4 — Activate via cron
 
 ```bash
 echo "* * * * * /usr/bin/wg_failover.sh" >> /etc/crontabs/root
 /etc/init.d/cron restart
 ```
 
-**Step 4 — Verify it is running:**
+> **Note:** The script runs every minute via cron. The `CHECK_INTERVAL` setting (default 60s) throttles actual checks so overlapping invocations exit early rather than stacking up. See [Settings Reference](#settings-reference) for tuning.
+
+### Step 5 — Verify it's working
 
 ```bash
 # Wait a minute, then check the log
@@ -77,186 +160,86 @@ tail -20 /var/log/wg_failover.log
 
 ---
 
-## Configuration
+## Peer Switching Methods
 
-All configuration is at the top of the script:
+The script supports two methods for switching WireGuard peers, controlled by `GLINET_SWITCH_METHOD`.
 
-```bash
-vi /usr/bin/wg_failover.sh
-```
-
-### Discovering Your Values
-
-Run these commands on your router to find the correct values before editing.
+### Method 1 — UCI/ubus (default, works on all OpenWrt routers)
 
 ```bash
-# 1. Find your WAN interface
-ip route show default | awk '{print $5}'
+GLINET_SWITCH_METHOD='uci'
 ```
 
-The output is your `WAN_IFACE` value.
+Uses standard OpenWrt tools (`uci` and `ubus`) to update the active peer and bounce the tunnel interface. Works on any OpenWrt router and requires no credentials.
 
----
+**Drawback on GL.iNet routers:** The GL.iNet web dashboard is not informed of the peer change and will continue to display the last server selected through the GUI. On reboot, the router will reconnect to whichever peer was last chosen in the dashboard, not the one the script had switched to.
+
+If dashboard accuracy and reboot persistence don't matter to you, this is the right choice — it's faster and keeps credentials out of the script.
+
+### Method 2 — GL.iNet Dashboard API (GL.iNet routers only)
 
 ```bash
-# 2. List your WireGuard tunnel interfaces and their currently active peer
-uci show network | grep 'wgclient.*\.config='
+GLINET_SWITCH_METHOD='auto'            # auto=API first, fall back to UCI | api=API only | uci=skip API
+GLINET_ROUTER='http://192.168.8.1/rpc' # Router JSON-RPC endpoint
+GLINET_USER='root'                     # Router admin username
+GLINET_PASS='yourpassword'             # Router admin password
 ```
 
-```
-network.wgclient1.config='peer_2001'
-network.wgclient2.config='peer_2006'
-```
+Performs the switch through the GL.iNet JSON-RPC API so the router dashboard and reboots stay in sync.
 
-The interface names (`wgclient1`, `wgclient2`) are your `TUNNEL_X_IFACE` and `TUNNEL_X_WG_IF` values.
+**Drawbacks:**
 
----
+- Requires storing your router admin password in the script — use `chmod 700 /usr/bin/wg_failover.sh` to restrict read access.
+- Slower than UCI switching — the API call involves a login/challenge/set/logout cycle (4 HTTP requests per switch).
+- Only works on GL.iNet firmware 4.x. Setting `api` or `auto` on a non-GL.iNet router will fail and — if using `auto` — fall back to UCI.
+
+> **Recommendation:** Leave `GLINET_SWITCH_METHOD='uci'` unless you specifically need the dashboard to reflect automated switches. Set `auto` if you want best-effort dashboard sync with a safe fallback.
+
+The switch method can also be overridden at runtime without editing the script:
 
 ```bash
-# 3. List all available VPN servers
-uci show wireguard | grep '\.name='
-```
-
-```
-wireguard.peer_100.name='Provider-SetA-Server1'
-wireguard.peer_101.name='Provider-SetA-Server2'
-wireguard.peer_102.name='Provider-SetA-Server3'
-wireguard.peer_103.name='Provider-SetB-Server1'
-wireguard.peer_104.name='Provider-SetB-Server2'
-```
-
-Choose a keyword substring present in all server names for each tunnel's pool — `SetA`, `SetB`, etc. You need at least 2 matching servers per tunnel. These become your `TUNNEL_X_KEYWORD` values.
-
----
-
-```bash
-# 4. Find the routing table assigned to each tunnel
-uci show network | grep ip4table
-```
-
-```
-network.wgclient1.ip4table='1001'
-network.wgclient2.ip4table='1002'
-```
-
-The table numbers are your `TUNNEL_X_ROUTE_TABLE` values.
-
----
-
-### Configuring Your Tunnels
-
-With the values found above, fill in the tunnel definitions:
-
-```bash
-TUNNEL_COUNT=2
-
-# Tunnel 1: Primary VPN — all Set A servers, no rotation
-TUNNEL_1_IFACE='wgclient1'
-TUNNEL_1_WG_IF='wgclient1'
-TUNNEL_1_LABEL='Primary (Set A)'
-TUNNEL_1_KEYWORD='SetA'
-TUNNEL_1_ROUTE_TABLE='1001'
-TUNNEL_1_ENABLED=1
-TUNNEL_1_ROTATE_INTERVAL=0
-TUNNEL_1_ROTATE_AT=''
-
-# Tunnel 2: Secondary VPN — all Set B servers, rotates every 6h and at 3am
-TUNNEL_2_IFACE='wgclient2'
-TUNNEL_2_WG_IF='wgclient2'
-TUNNEL_2_LABEL='Secondary (Set B)'
-TUNNEL_2_KEYWORD='SetB'
-TUNNEL_2_ROUTE_TABLE='1002'
-TUNNEL_2_ENABLED=1
-TUNNEL_2_ROTATE_INTERVAL=6
-TUNNEL_2_ROTATE_AT='03:00'
+/usr/bin/wg_failover.sh --switch-method uci
+/usr/bin/wg_failover.sh --switch-method api
+/usr/bin/wg_failover.sh --switch-method auto
 ```
 
 ---
 
-### Scheduled Rotation
+## Scheduled Rotation
 
 Each tunnel can rotate to the next server on a schedule, independent of whether the current server is healthy. Both conditions can be set simultaneously — whichever triggers first wins.
 
-| Variable                   | Description                                                      |
-| -------------------------- | ---------------------------------------------------------------- |
-| `TUNNEL_X_ROTATE_INTERVAL` | Hours between forced rotations. `0` = disabled.                  |
-| `TUNNEL_X_ROTATE_AT`       | Time-of-day rotation in `HH:MM` 24-hour format. `''` = disabled. |
+```bash
+TUNNEL_1_ROTATE_INTERVAL=0        # Hours between forced rotations. 0 = disabled.
+TUNNEL_1_ROTATE_AT=''             # Time-of-day rotation in HH:MM 24-hour format. '' = disabled.
+```
 
-Rotation always verifies the new server with a ping test. If the rotated-to server fails, it is placed in cooldown and the rotation timestamp is still recorded to avoid hammering a bad server every minute. A successful rotation sends a `rotated` webhook notification and is marked `[rotation]` in the log.
+**Examples:**
+
+```bash
+# Rotate every 6 hours
+TUNNEL_1_ROTATE_INTERVAL=6
+
+# Rotate at 3am daily
+TUNNEL_1_ROTATE_AT='03:00'
+
+# Both — whichever triggers first
+TUNNEL_1_ROTATE_INTERVAL=6
+TUNNEL_1_ROTATE_AT='03:00'
+```
+
+A successful rotation sends a `rotated` webhook notification and is marked `[rotation]` in the log.
 
 ---
 
-### Blank Keyword — Global VPN Mode / Catch-All Pool
+## Keyword Behaviour
 
-Setting `TUNNEL_X_KEYWORD=''` tells the script to build that tunnel's pool from all servers not claimed by another tunnel's keyword.
+The `TUNNEL_X_KEYWORD` determines which servers belong to a tunnel's pool:
 
-**Single global VPN — one tunnel, all servers:**
+- **Keyword set (e.g. `SetA`):** The tunnel can only use servers whose names contain that substring. Servers matching `SetA` are exclusive to that tunnel.
+- **Keyword empty (`''`):** The tunnel uses all servers _not claimed_ by other tunnels with keywords. Useful for a single global VPN or a catch-all secondary tunnel. Only one tunnel may use an empty keyword. If multiple tunnels have empty keywords, only the first is used and the rest are skipped with an error.
 
-```bash
-TUNNEL_COUNT=1
-
-TUNNEL_1_IFACE='wgclient1'
-TUNNEL_1_WG_IF='wgclient1'
-TUNNEL_1_LABEL='Global VPN'
-TUNNEL_1_KEYWORD=''         # Blank = use ALL configured servers as the pool
-TUNNEL_1_ROUTE_TABLE='1001'
-TUNNEL_1_ENABLED=1
-TUNNEL_1_ROTATE_INTERVAL=0
-TUNNEL_1_ROTATE_AT=''
-```
-
-**Mixed — keyword tunnel plus a catch-all:**
-
-```bash
-TUNNEL_COUNT=2
-
-TUNNEL_1_KEYWORD='SetA'  # Claims all servers whose name contains 'SetA'
-TUNNEL_2_KEYWORD=''      # Gets everything not claimed by any other tunnel
-```
-
-> Only one tunnel may have a blank keyword. If more than one is blank, only the first will be used and the others will be skipped with an error logged.
-
----
-
-### Global Settings Reference
-
-| Variable                        | Description                                                    | Default                    |
-| ------------------------------- | -------------------------------------------------------------- | -------------------------- |
-| `CHECK_INTERVAL`                | Seconds between checks (cron throttle)                         | `60`                       |
-| `HANDSHAKE_TIMEOUT`             | Seconds before a handshake is considered stale                 | `180`                      |
-| `PEER_COOLDOWN`                 | Seconds before a failed server can be retried                  | `600`                      |
-| `POST_SWITCH_HANDSHAKE_TIMEOUT` | Seconds to poll for a handshake after switching                | `45`                       |
-| `POST_SWITCH_DELAY`             | Seconds to wait before pinging if handshake poll times out     | `20`                       |
-| `POST_SWITCH_GRACE`             | Seconds of monitoring pause after a successful switch          | `60`                       |
-| `PING_VERIFY`                   | Enable ping verification after switching (`1` = yes, `0` = no) | `1`                        |
-| `PING_TARGET`                   | Primary IP address to ping for verification                    | `1.1.1.1`                  |
-| `PING_TARGET_FALLBACK`          | Secondary ping target used if the primary fails                | `8.8.8.8`                  |
-| `PING_COUNT`                    | Number of ping packets to send                                 | `3`                        |
-| `PING_TIMEOUT`                  | Seconds to wait per ping reply                                 | `5`                        |
-| `WAN_IFACE`                     | WAN interface used for pre-flight connectivity checks          | `eth1`                     |
-| `WAN_CHECK_TARGETS`             | Space-separated IPs used to verify WAN reachability            | `1.1.1.1 8.8.8.8`          |
-| `WAN_WEBHOOK_INTERVAL`          | Minimum seconds between repeated `wan_down` webhook alerts     | `300`                      |
-| `MAX_FAILOVER_ATTEMPTS`         | Max servers to try per cycle (`0` = unlimited)                 | `0`                        |
-| `HISTORY_MAX_LINES`             | Max switch history entries per tunnel (`0` = unlimited)        | `500`                      |
-| `LOG_FILE`                      | Log file path (set to `''` to disable)                         | `/var/log/wg_failover.log` |
-| `LOG_MAX_SIZE`                  | Max log size in bytes before rotation                          | `102400`                   |
-| `LOG_LEVEL`                     | `0` silent · `1` changes only · `2` normal · `3` verbose       | `2`                        |
-| `WEBHOOK_URL`                   | Notification URL (set to `''` to disable)                      | `''`                       |
-| `WEBHOOK_METHOD`                | `GET` or `POST`                                                | `GET`                      |
-| `STATE_DIR`                     | Directory for state files and lockfile                         | `/tmp/wg_failover`         |
-
-### Per-Tunnel Settings Reference
-
-| Variable                   | Description                                                                   |
-| -------------------------- | ----------------------------------------------------------------------------- |
-| `TUNNEL_X_IFACE`           | OpenWrt network interface name (e.g. `wgclient1`)                             |
-| `TUNNEL_X_WG_IF`           | WireGuard kernel interface name (usually same as IFACE)                       |
-| `TUNNEL_X_LABEL`           | Friendly name used in logs, webhooks, and flag targeting                      |
-| `TUNNEL_X_KEYWORD`         | Substring to match server names · blank = all unclaimed servers               |
-| `TUNNEL_X_ROUTE_TABLE`     | Routing table number for ping verification · blank = interface-bound fallback |
-| `TUNNEL_X_ENABLED`         | `1` = monitor · `0` = skip this tunnel                                        |
-| `TUNNEL_X_ROTATE_INTERVAL` | Hours between forced rotations · `0` = disabled                               |
-| `TUNNEL_X_ROTATE_AT`       | Time-of-day rotation as `HH:MM` · `''` = disabled                             |
+**Example:** Tunnel 1 has keyword `SetA`, Tunnel 2 has keyword `SetB`, Tunnel 3 has empty keyword. Tunnel 1 gets all `SetA` servers, Tunnel 2 gets all `SetB` servers, Tunnel 3 gets everything else.
 
 ---
 
@@ -277,17 +260,18 @@ The script is called automatically by cron every minute. No manual intervention 
 
 All flags are composable and may appear in any order. Tunnel targeting accepts either a label or `--iface <iface>` in place of a label.
 
-| Flag                     | Description                                                                                                 |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| `--dry-run`              | Run full logic but make no changes. Output goes to stdout, not the log.                                     |
-| `--fail <label>`         | Treat the named tunnel as failed, triggering an immediate switch.                                           |
-| `--fail-wan`             | Simulate a WAN outage — failover is suppressed on all tunnels this run.                                     |
-| `--force-rotate [label]` | Immediately rotate to the next peer without simulating a failure. Omit label to rotate all.                 |
-| `--exercise [label]`     | Run a full forward/return switch test. Reverts automatically. Suppresses webhooks and log writes.           |
-| `--revert`               | After a successful switch, switch back to the original peer.                                                |
-| `--ignore-cooldown`      | Skip cooldown checks when selecting the next peer.                                                          |
-| `--iface <iface>`        | Sub-qualifier for `--fail`, `--exercise`, and `--force-rotate` — target by interface name instead of label. |
-| `--version`              | Print version and exit.                                                                                     |
+| Flag                       | Description                                                                                                 |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `--dry-run`                | Run full logic but make no changes. Output goes to stdout, not the log.                                     |
+| `--fail <label>`           | Treat the named tunnel as failed, triggering an immediate switch.                                           |
+| `--fail-wan`               | Simulate a WAN outage — failover is suppressed on all tunnels this run.                                     |
+| `--force-rotate [label]`   | Immediately rotate to the next peer without simulating a failure. Omit label to rotate all.                 |
+| `--exercise [label]`       | Run a full forward/return switch test. Reverts automatically. **Suppresses webhooks and log writes.**       |
+| `--revert`                 | After a successful switch, switch back to the original peer.                                                |
+| `--ignore-cooldown`        | Skip cooldown checks when selecting the next peer.                                                          |
+| `--switch-method <method>` | Override `GLINET_SWITCH_METHOD` for this run. Values: `auto` \| `api` \| `uci`.                             |
+| `--iface <iface>`          | Sub-qualifier for `--fail`, `--exercise`, and `--force-rotate` — target by interface name instead of label. |
+| `--version`                | Print version and exit.                                                                                     |
 
 The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisation.
 
@@ -302,10 +286,10 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 /usr/bin/wg_failover.sh --dry-run
 
 # Trigger an immediate failover on a specific tunnel
-/usr/bin/wg_failover.sh --fail "Primary (Set A)"
+/usr/bin/wg_failover.sh --fail "Primary"
 
 # Force a rotation without simulating a failure
-/usr/bin/wg_failover.sh --force-rotate "Primary (Set A)"
+/usr/bin/wg_failover.sh --force-rotate "Primary"
 /usr/bin/wg_failover.sh --force-rotate --iface wgclient1
 
 # Simulate a WAN outage (failover suppressed on all tunnels)
@@ -313,12 +297,91 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 
 # Run a full end-to-end exercise test (switches and auto-reverts)
 /usr/bin/wg_failover.sh --exercise
-/usr/bin/wg_failover.sh --exercise "Primary (Set A)"
+/usr/bin/wg_failover.sh --exercise "Primary"
+
+# Switch using UCI only, regardless of configured method
+/usr/bin/wg_failover.sh --switch-method uci --force-rotate
 
 # Clear all state
 /usr/bin/wg_failover.sh reset
 /usr/bin/wg_failover.sh reset --keep-history
 ```
+
+---
+
+## Settings Reference
+
+### Tunnel Definitions
+
+| Variable                   | Description                                                                   |
+| -------------------------- | ----------------------------------------------------------------------------- |
+| `TUNNEL_COUNT`             | Total number of tunnels defined below                                         |
+| `TUNNEL_X_IFACE`           | OpenWrt network interface name (e.g. `wgclient1`)                             |
+| `TUNNEL_X_WG_IF`           | WireGuard kernel interface name (usually same as `TUNNEL_X_IFACE`)            |
+| `TUNNEL_X_LABEL`           | Friendly name used in logs, webhooks, and flag targeting                      |
+| `TUNNEL_X_KEYWORD`         | Substring to match server names · blank = all unclaimed servers               |
+| `TUNNEL_X_ROUTE_TABLE`     | Routing table number for ping verification · blank = interface-bound fallback |
+| `TUNNEL_X_ENABLED`         | `1` = monitor · `0` = skip this tunnel                                        |
+| `TUNNEL_X_ROTATE_INTERVAL` | Hours between forced rotations · `0` = disabled                               |
+| `TUNNEL_X_ROTATE_AT`       | Time-of-day rotation as `HH:MM` · `''` = disabled                             |
+
+### WAN Safety Guard
+
+| Variable            | Description                                          | Default           |
+| ------------------- | ---------------------------------------------------- | ----------------- |
+| `WAN_IFACE`         | WAN interface for pre-flight checks · `''` = disable | `eth1`            |
+| `WAN_CHECK_TARGETS` | Space-separated IPs used to verify WAN reachability  | `1.1.1.1 8.8.8.8` |
+
+### GL.iNet Dashboard API
+
+| Variable               | Description                                                          | Default                  |
+| ---------------------- | -------------------------------------------------------------------- | ------------------------ |
+| `GLINET_SWITCH_METHOD` | `uci` = UCI only · `api` = API only · `auto` = API with UCI fallback | `auto`                   |
+| `GLINET_ROUTER`        | Router JSON-RPC endpoint                                             | `http://192.168.8.1/rpc` |
+| `GLINET_USER`          | Router admin username                                                | `root`                   |
+| `GLINET_PASS`          | Router admin password                                                | `''`                     |
+
+### Failover Tuning
+
+| Variable                        | Description                                                                                                | Default |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------- |
+| `HANDSHAKE_TIMEOUT`             | Seconds before a handshake is considered stale                                                             | `180`   |
+| `PRE_FAILOVER_PING`             | Ping the current peer before failing over — skips switch if traffic is still flowing (`1` = yes, `0` = no) | `1`     |
+| `POST_SWITCH_HANDSHAKE_TIMEOUT` | Seconds to poll for a handshake after switching                                                            | `45`    |
+| `POST_SWITCH_DELAY`             | Seconds to wait before pinging if handshake poll times out                                                 | `20`    |
+| `POST_SWITCH_GRACE`             | Seconds of monitoring pause after a successful switch                                                      | `60`    |
+| `PEER_COOLDOWN`                 | Seconds before a failed server can be retried                                                              | `600`   |
+| `MAX_FAILOVER_ATTEMPTS`         | Max peers to try per cycle · `0` = try all                                                                 | `0`     |
+| `HANDSHAKE_POLL_INTERVAL`       | Seconds between handshake polls after switching                                                            | `3`     |
+
+### Ping Verification
+
+| Variable               | Description                                          | Default   |
+| ---------------------- | ---------------------------------------------------- | --------- |
+| `PING_VERIFY`          | Enable ping verification after switching (`1` = yes) | `1`       |
+| `PING_TARGET`          | Primary IP to ping for post-switch verification      | `1.1.1.1` |
+| `PING_TARGET_FALLBACK` | Secondary ping target if primary fails               | `8.8.8.8` |
+| `PING_COUNT`           | Packets per ping test                                | `3`       |
+| `PING_TIMEOUT`         | Seconds per ping reply                               | `5`       |
+
+### Logging
+
+| Variable            | Description                                              | Default                    |
+| ------------------- | -------------------------------------------------------- | -------------------------- |
+| `LOG_FILE`          | Log file path · `''` = disable                           | `/var/log/wg_failover.log` |
+| `LOG_MAX_SIZE`      | Max log size in bytes before rotation                    | `102400`                   |
+| `LOG_MAX_LINES`     | Lines kept after log rotation                            | `500`                      |
+| `LOG_LEVEL`         | `0` silent · `1` changes only · `2` normal · `3` verbose | `2`                        |
+| `HISTORY_MAX_LINES` | Max switch history entries per tunnel · `0` = unlimited  | `500`                      |
+| `STATE_DIR`         | Directory for runtime state files and lockfile           | `/tmp/wg_failover`         |
+
+### Webhook Notifications
+
+| Variable               | Description                                         | Default |
+| ---------------------- | --------------------------------------------------- | ------- |
+| `WEBHOOK_URL`          | Notification endpoint · `''` = disable              | `''`    |
+| `WEBHOOK_METHOD`       | `GET` appends query params · `POST` sends JSON body | `GET`   |
+| `WAN_WEBHOOK_INTERVAL` | Minimum seconds between repeated `wan_down` alerts  | `300`   |
 
 ---
 
@@ -332,6 +395,8 @@ Set `WEBHOOK_URL` to receive a notification on failover, rotation, or WAN state 
 WEBHOOK_URL='https://ntfy.sh/your-topic-name'
 WEBHOOK_METHOD='GET'
 ```
+
+When using `GET`, parameters are appended as query strings: `?tunnel=...&from=...&to=...&status=...`
 
 ### Gotify (self-hosted, POST)
 
@@ -378,6 +443,8 @@ POST payload:
 Default location: `/var/log/wg_failover.log`
 
 > **OpenWrt note:** `/var/log/` is stored in RAM and cleared on every reboot. This is normal behaviour.
+
+### Log Levels
 
 | Level | What is logged                                                            |
 | ----- | ------------------------------------------------------------------------- |
@@ -446,24 +513,47 @@ Increase `HANDSHAKE_TIMEOUT` to `240` or `300`. WireGuard re-handshakes roughly 
 
 ### A tunnel is off but the script still monitors it
 
-The script checks whether each interface is administratively up before monitoring — if you switch a tunnel off in the GL.iNet admin panel it will be skipped automatically. You can also set `TUNNEL_X_ENABLED=0` to permanently exclude a tunnel without removing its configuration.
+The script checks whether each interface is administratively up before monitoring — if you disable a tunnel interface it will be skipped automatically. You can also set `TUNNEL_X_ENABLED=0` to permanently exclude a tunnel without removing its configuration.
+
+### GL.iNet API switch fails
+
+Check that `GLINET_ROUTER` points to the correct IP and port for your router's JSON-RPC endpoint (`{ROUTER_IP}/rpc`). Verify the credentials are correct by logging into the dashboard manually. If the API is intermittently unreachable, switch to `GLINET_SWITCH_METHOD='auto'` so failed API calls fall back to UCI automatically. If you don't need dashboard sync at all, use `GLINET_SWITCH_METHOD='uci'`.
+
+---
+
+## Uninstallation
+
+To completely remove the script and its state:
+
+```bash
+# Remove cron entry
+sed -i '/wg_failover.sh/d' /etc/crontabs/root
+/etc/init.d/cron restart
+
+# Remove the script
+rm /usr/bin/wg_failover.sh
+
+# Remove state files and logs
+rm -rf /tmp/wg_failover
+rm -f /var/log/wg_failover.log
+```
 
 ---
 
 ## Limitations
 
-### Out-of-sync GL.iNet dashboard
+### Out-of-sync GL.iNet dashboard (UCI mode)
 
-This project switches WireGuard peers outside of the GL.iNet VPN Client application. As a result, the router dashboard will likely display incorrect server information after an automated failover.
+When using UCI switching (`GLINET_SWITCH_METHOD='uci'`), peer changes happen outside of the GL.iNet VPN Client application and the dashboard is not notified.
 
-| Component                       | Reported VPN server                           |
-| ------------------------------- | --------------------------------------------- |
-| Failover script (`status`)      | ✅ Correct (actual active peer)               |
-| WireGuard CLI / traffic routing | ✅ Correct                                    |
-| GL.iNet Web Dashboard           | ❌ Likely shows last GUI-selected server      |
-| Router reboot behaviour         | ❌ Likely reconnects last GUI-selected server |
+| Component                       | Reported VPN server                       |
+| ------------------------------- | ----------------------------------------- |
+| Failover script (`status`)      | ✅ Correct (actual active peer)           |
+| WireGuard CLI / traffic routing | ✅ Correct                                |
+| GL.iNet Web Dashboard           | ❌ Shows last GUI-selected server         |
+| Router reboot behaviour         | ❌ Reconnects to last GUI-selected server |
 
-Traffic routing, kill-switch behaviour, DNS, and connectivity all use the new active peer — only the dashboard display is affected.
+Traffic routing, kill-switch behaviour, DNS, and connectivity all use the new active peer — only the dashboard display and reboot persistence are affected.
 
 To verify the real connection at any time:
 
@@ -471,7 +561,7 @@ To verify the real connection at any time:
 /usr/bin/wg_failover.sh status
 ```
 
-**If anyone has suggestions to fix this, please let me know!**
+Set `GLINET_SWITCH_METHOD='api'` or `'auto'` to keep the dashboard in sync, keeping in mind the [drawbacks noted above](#method-2--glinet-dashboard-api-glinet-routers-only).
 
 ---
 
