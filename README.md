@@ -2,7 +2,9 @@
 
 **WireGuard Tunnel Failover and Auto-Rotation for OpenWrt**
 
-Monitors WireGuard tunnels and automatically switches to another server from the pool when the active peer becomes unresponsive. Also supports scheduled server rotation independent of tunnel health.
+Monitors your WireGuard VPN connection and automatically switches to another server if the current one stops responding (active peer becomes unresponsive). You can also set it to rotate servers on a schedule, even when nothing is broken (independent of tunnel health).
+
+Compatible with both policy-based routing and global VPN modes on OpenWrt routers, with special (optional) handling for GL.iNet OpenWrt routers.
 
 ---
 
@@ -57,15 +59,7 @@ chmod +x /usr/bin/wg_failover.sh
 
 Run the following commands on your router and note the output. You'll need these values for configuration.
 
-#### A) Get the WAN interface
-
-```bash
-ip route show default | awk '{print $5}'
-```
-
-Use the output as `WAN_IFACE`.
-
-#### B) Identify WireGuard tunnel interfaces
+#### A) Identify WireGuard tunnel interfaces
 
 ```bash
 uci show network | grep 'wgclient.*\.config='
@@ -80,7 +74,7 @@ network.wgclient2.config='peer_2006'
 
 The interface names (`wgclient1`, `wgclient2`) are used for `TUNNEL_X_IFACE` and `TUNNEL_X_WG_IF`.
 
-#### C) List available VPN servers
+#### B) List available VPN servers
 
 ```bash
 uci show wireguard | grep '\.name='
@@ -98,7 +92,7 @@ wireguard.peer_104.name='Provider-SetB-Server2'
 
 Choose a keyword (substring) that appears in all servers belonging to a tunnel pool (e.g. `SetA`, `SetB`). Each tunnel requires **at least two matching servers**. These become `TUNNEL_X_KEYWORD`.
 
-#### D) Find routing tables per tunnel
+#### C) Find routing tables per tunnel
 
 ```bash
 uci show network | grep ip4table
@@ -113,6 +107,14 @@ network.wgclient2.ip4table='1002'
 
 Use these values for `TUNNEL_X_ROUTE_TABLE`.
 
+#### D) Get the WAN interface
+
+```bash
+ip route show default | awk '{print $5}'
+```
+
+Use the output as `WAN_IFACE`.
+
 ### Step 3 — Configure the script
 
 Edit the script with your gathered values:
@@ -124,17 +126,17 @@ vi /usr/bin/wg_failover.sh
 **Minimum required configuration** (fill in values from Step 2):
 
 ```bash
-# WAN
-WAN_IFACE='eth1'                     # From Step 2A
-
 # Tunnel 1
 TUNNEL_COUNT=1
-TUNNEL_1_IFACE='wgclient1'           # From Step 2B
-TUNNEL_1_WG_IF='wgclient1'           # From Step 2B
+TUNNEL_1_IFACE='wgclient1'           # From Step 2A
+TUNNEL_1_WG_IF='wgclient1'           # From Step 2A
 TUNNEL_1_LABEL='Primary'             # Friendly name (free text)
-TUNNEL_1_KEYWORD='SetA'              # From Step 2C
-TUNNEL_1_ROUTE_TABLE='1001'          # From Step 2D
+TUNNEL_1_KEYWORD='SetA'              # From Step 2B
+TUNNEL_1_ROUTE_TABLE='1001'          # From Step 2C
 TUNNEL_1_ENABLED=1
+
+# WAN
+WAN_IFACE='eth1'                     # From Step 2D
 ```
 
 See [Configuration Reference](#configuration-reference) for all available options including multiple tunnels, rotation schedules, and GL.iNet API integration.
@@ -329,7 +331,7 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 
 | Variable            | Description                                          | Default           |
 | ------------------- | ---------------------------------------------------- | ----------------- |
-| `WAN_IFACE`         | WAN interface for pre-flight checks · `''` = disable | `eth1`            |
+| `WAN_IFACE`         | WAN interface for pre-flight checks · `''` = disable | `''`              |
 | `WAN_CHECK_TARGETS` | Space-separated IPs used to verify WAN reachability  | `1.1.1.1 8.8.8.8` |
 
 ### GL.iNet Dashboard API
@@ -578,6 +580,7 @@ Issues and pull requests are welcome.
 ## Support
 
 Discord server: [Discord](https://discord.gg/e3eXGTJbjx).
+
 If this script has been useful to you, a coffee is always appreciated — thank you!
 
 [![Buy Me A Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/92jackson)
