@@ -577,6 +577,7 @@ Issues and pull requests are welcome.
 
 ## Support
 
+Discord server: [Discord](https://discord.gg/e3eXGTJbjx).
 If this script has been useful to you, a coffee is always appreciated — thank you!
 
 [![Buy Me A Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/92jackson)
