@@ -2,7 +2,7 @@
 
 **WireGuard Tunnel Failover and Auto-Rotation for OpenWrt**
 
-Monitors your WireGuard VPN connection and automatically switches to another server if the current one stops responding (active peer becomes unresponsive). You can also set it to rotate servers on a schedule, even when nothing is broken (independent of tunnel health).
+Monitors your WireGuard VPN connection and automatically switches to another server if the current one stops responding (active peer becomes unresponsive). You can also set it to auto-swap on a schedule (every X hours and/or at a specific time of day), regardless of tunnel health.
 
 Compatible with both policy-based routing and global VPN modes on OpenWrt routers, with special (optional) handling for GL.iNet OpenWrt routers.
 
