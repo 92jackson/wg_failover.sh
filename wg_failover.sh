@@ -1,6 +1,6 @@
 #!/bin/sh
 # =================================================================================
-VER='1.2.0'
+VER='1.2.1'
 # WireGuard VPN Tunnel Failover and Auto-Rotate for OpenWrt
 #
 # GitHub : https://github.com/92jackson/wg_failover.sh
@@ -29,7 +29,7 @@ VER='1.2.0'
 # ---------------------------------------------------------------------------------
 #   1. Copy script     :  scp wg_failover.sh root@192.168.8.1:/usr/bin/
 #   2. Make executable :  chmod +x /usr/bin/wg_failover.sh
-#   3. Configure       :  vi /usr/bin/wg_failover.sh
+#   3. Configure       :  vi /usr/bin/wg_failover.sh   (see readme for details)
 #   4. Add to cron     :  echo "* * * * * /usr/bin/wg_failover.sh" >> /etc/crontabs/root
 #   5. Restart cron    :  /etc/init.d/cron restart
 #
@@ -91,43 +91,43 @@ VER='1.2.0'
 # At least one tunnel must be defined for the script to function.
 #
 # Use these commands to discover values before editing:
-#   (1) List WG interfaces:   uci show network | grep 'wgclient.*\.config='
-#   (2) List servers (peers): uci show wireguard | grep '\.name='
-#   (3) Routing tables:       uci show network | grep ip4table
-# For more detail on setting up tunnels, see: https://github.com/92jackson/wg_failover.sh/tree/main#configuration
+#   (a) List WG interfaces:   uci show network | grep 'wgclient.*\.config='
+#   (b) List servers (peers): uci show wireguard | grep '\.name='
+#   (c) Routing tables:       uci show network | grep ip4table
+# For more detail on setting up tunnels, see: https://github.com/92jackson/wg_failover.sh#step-2--run-discovery-commands
 # =============================================================================
 
-TUNNEL_COUNT=2                     # Number of tunnels on router AND defined below
+TUNNEL_COUNT=1                     # Number of tunnels on router AND defined below
 
 # TUNNEL 1 EXAMPLE
 TUNNEL_1_IFACE='wgclient1'         # (1) OpenWrt interface name
 TUNNEL_1_WG_IF='wgclient1'         # WireGuard kernel interface (usually same as _IFACE)
-TUNNEL_1_LABEL='Primary (UK)'      # Friendly name for logs/webhooks (text)
-TUNNEL_1_KEYWORD='UK'              # (2) Substring matching this tunnel's peers
+TUNNEL_1_LABEL='Primary'           # Friendly name for logs/webhooks (free text)
+TUNNEL_1_KEYWORD=''                # (2) Substring matching this tunnel's peers. '' = all unallocated peers
 TUNNEL_1_ROUTE_TABLE='1001'        # (3) Routing table
 TUNNEL_1_ENABLED=1                 # 1=script monitors tunnel, 0=ignore
 TUNNEL_1_ROTATE_INTERVAL=0         # Hours between forced rotations (0=disabled)
 TUNNEL_1_ROTATE_AT=''              # Daily rotation time HH:MM (optional)
 
 # TUNNEL 2 EXAMPLE
-TUNNEL_2_IFACE='wgclient2'
-TUNNEL_2_WG_IF='wgclient2'
-TUNNEL_2_LABEL='Streaming (Albania)'
-TUNNEL_2_KEYWORD='AL'
-TUNNEL_2_ROUTE_TABLE='1002'
-TUNNEL_2_ENABLED=1
-TUNNEL_2_ROTATE_INTERVAL=6          # Rotate every 6 hours
-TUNNEL_2_ROTATE_AT='03:00'          # Daily at 03:00 (whichever triggers first)
+#TUNNEL_2_IFACE='wgclient2'
+#TUNNEL_2_WG_IF='wgclient2'
+#TUNNEL_2_LABEL='Streaming'
+#TUNNEL_2_KEYWORD='CCwGTV'
+#TUNNEL_2_ROUTE_TABLE='1002'
+#TUNNEL_2_ENABLED=1
+#TUNNEL_2_ROTATE_INTERVAL=6        # Rotate every 6 hours
+#TUNNEL_2_ROTATE_AT='03:00'        # Daily at 03:00 (whichever triggers first)
 
 
 # =============================================================================
 # WAN SAFETY GUARD (RECOMMENDED)
 # Prevents cooling down all peers when your ISP/WAN is down.
 #
-# Find interface via: ip route show default | awk '{print $5}'
+#   (d) WAN interface:    ip route show default | awk '{print $5}'
 # =============================================================================
 
-WAN_IFACE='eth1'                     # Set to '' to disable WAN checking
+WAN_IFACE=''                         # (d) WAN interface. '' to disable WAN checking
 WAN_CHECK_TARGETS='1.1.1.1 8.8.8.8'  # Reliable IPs to confirm internet access
 
 
@@ -184,7 +184,7 @@ HANDSHAKE_POLL_INTERVAL=3           # How often to poll for new handshake
 # LOGGING
 # =============================================================================
 
-LOG_FILE='/var/log/wg_failover.log' # Log location, '' to disable
+LOG_FILE='/var/log/wg_failover.log' # Log location. '' to disable
 LOG_MAX_SIZE=102400                 # Rotate log when exceeding size (bytes)
 LOG_MAX_LINES=500                   # Lines kept after rotation
 LOG_LEVEL=2                         # 0 silent | 1 errors | 2 normal | 3 verbose
@@ -197,7 +197,7 @@ STATE_DIR='/tmp/wg_failover'        # Runtime state
 # See: https://github.com/92jackson/wg_failover.sh/tree/main#webhook-notifications
 # =============================================================================
 
-WEBHOOK_URL=''                      # Set endpoint to enable notifications, '' to disable
+WEBHOOK_URL=''                      # Set endpoint to enable notifications. '' to disable
 WEBHOOK_METHOD='GET'                # GET appends query | POST sends JSON
 WAN_WEBHOOK_INTERVAL=300            # Rate-limit WAN outage alerts
 
@@ -231,8 +231,6 @@ FLAG_SWITCH_METHOD=''
 INTERACTIVE=''
 TEST_PASS=0
 TEST_FAIL=0
-STATUS_LIVE=0
-STATUS_LIVE_INTERVAL=5
 
 
 # --- Argument parsing ---------------------------------------------------------
@@ -379,21 +377,137 @@ parse_args() {
 		esac
 	done
 
-	# Warn when --fail-wan and --fail are combined — behaviour is unintuitive:
-	# the targeted tunnel's SIMULATE_THIS bypasses the WAN pre-flight so its
-	# failover proceeds, while all other tunnels are suppressed by the WAN check.
+	# Warn when --fail-wan and --fail are combined
 	if [ "$FLAG_FAIL_WAN" = "1" ] && [ "$FLAG_FAIL" = "1" ]; then
-		echo "Warning: --fail-wan and --fail are combined."
-		if [ -n "$FLAG_FAIL_IFACE" ]; then
-			echo "  The tunnel on iface '${FLAG_FAIL_IFACE}' will failover (pre-flight bypassed)."
-		else
-			echo "  The tunnel labelled '${FLAG_FAIL_LABEL}' will failover (pre-flight bypassed)."
-		fi
-		echo "  All other tunnels will have failover suppressed by the simulated WAN outage."
-		echo "  Press Ctrl-C to abort, or wait 3 seconds to continue..."
-		sleep 3
+		clear
+		echo ""
+		echo "Note: --fail-wan and --fail are combined."
+		echo "  This will simulate a WAN drop DURING the tunnel handshake check."
+		echo "  The prior WAN pre-flight check will show as OK."
+		echo ""
+		echo ""
 	fi
 }
+
+# --- Logging ------------------------------------------------------------------
+
+# Colour helpers
+# Colour helpers
+if [ -t 1 ]; then
+	_C_RESET=$(printf '\033[0m')
+	_C_BOLD=$(printf '\033[1m')
+	_C_DIM=$(printf '\033[2m')
+	_C_WHITE=$(printf '\033[97m')
+	_C_GREY=$(printf '\033[38;5;244m')
+	_C_GREEN=$(printf '\033[38;5;82m')
+	_C_BLUE=$(printf '\033[38;5;75m')
+	_C_AMBER=$(printf '\033[38;5;214m')
+	_C_LAVENDER=$(printf '\033[38;5;183m')
+	_C_RED=$(printf '\033[38;5;196m')
+	_C_ORANGE=$(printf '\033[38;5;202m')
+	_C_GOLD=$(printf '\033[38;5;220m')
+else
+	_C_RESET='' _C_BOLD='' _C_DIM='' _C_WHITE=''
+	_C_GREY='' _C_GREEN='' _C_BLUE='' _C_AMBER=''
+	_C_LAVENDER='' _C_RED='' _C_ORANGE='' _C_GOLD=''
+fi
+
+# Print a section header
+# Usage: status_section "TUNNELS"
+status_section() {
+	printf "\n${_C_BOLD}${_C_WHITE}  ── %s %s${_C_RESET}\n" "$1" \
+		"$(printf '%.0s─' $(seq 1 $((42 - ${#1}))))"
+}
+
+# Print a labelled status row, with optional colour applied to the value
+# Usage: status_row "Label" "value" [colour]
+status_row() {
+	_SR_LABEL=$1
+	_SR_VALUE=$2
+	_SR_COLOUR=${3:-}
+	printf "  ${_C_DIM}%-14s${_C_RESET} ${_SR_COLOUR}%s${_C_RESET}\n" "$_SR_LABEL" "$_SR_VALUE"
+}
+
+# Coloured ok/warn/err badges for inline use
+badge_ok()   { printf "${_C_GREEN}%s${_C_RESET}" "$1"; }
+badge_warn() { printf "${_C_AMBER}%s${_C_RESET}" "$1"; }
+badge_err()  { printf "${_C_RED}%s${_C_RESET}" "$1"; }
+
+log() {
+	LEVEL=$1
+	MSG=$2
+	[ "$LOG_LEVEL" -lt "$LEVEL" ] && return
+	[ -z "$LOG_FILE" ] && return
+
+	TIME_ONLY=$(date '+%H:%M:%S')
+	FULL_TS=$(date '+%Y-%m-%d %H:%M:%S')
+
+	# Don't write to log file in dry-run or exercise mode — stdout only
+	if [ "$DRY_RUN" = "0" ] && [ "$FLAG_EXERCISE" = "0" ]; then
+		if [ -f "$LOG_FILE" ]; then
+			SIZE=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+			if [ "$SIZE" -gt "$LOG_MAX_SIZE" ]; then
+				if [ "${LOG_MAX_LINES:-0}" -gt 0 ]; then
+					# Trim to last LOG_MAX_LINES lines via tmp file
+					_LOG_TMP=$(mktemp /tmp/wglog.XXXXXX)
+					tail -n "$LOG_MAX_LINES" "$LOG_FILE" > "$_LOG_TMP" 2>/dev/null
+					echo "[$FULL_TS] [INFO] Log trimmed to last ${LOG_MAX_LINES} lines (exceeded ${LOG_MAX_SIZE} bytes)" >> "$_LOG_TMP"
+					mv "$_LOG_TMP" "$LOG_FILE"
+				else
+					echo "[$FULL_TS] [INFO] Log rotated (exceeded ${LOG_MAX_SIZE} bytes)" > "$LOG_FILE"
+				fi
+			fi
+		fi
+		echo "[$FULL_TS] $MSG" >> "$LOG_FILE"
+	fi
+
+	if [ -n "$INTERACTIVE" ]; then
+		# Strip existing [INFO]/[CHANGE] prefix into a STATUS column
+		STATUS=$(printf "%s" "$MSG" | sed -n 's/^\[\([^]]*\)\][ ]*//p')
+		if [ -n "$STATUS" ]; then
+			PREFIX=$(printf "%s" "$MSG" | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+			test_step "$PREFIX" "$STATUS"
+		else
+			test_step "LOG" "$MSG"
+		fi
+	fi
+}
+
+log_info()    { log 2 "[INFO]   $1"; }
+log_change()  { log 1 "[CHANGE] $1"; }
+log_error()   { log 1 "[ERROR]  $1"; }
+log_warn()    { log 1 "[WARN]   $1"; }
+log_verbose() { log 3 "[DEBUG]  $1"; }
+log_dryrun()  {
+	TIME_ONLY=$(date '+%H:%M:%S')
+	printf "  [%s] ${_C_AMBER}%-8s${_C_RESET} %s\n" "$TIME_ONLY" "DRY-RUN" "$1"
+}
+
+# Exercise-mode step logger — always prints to stdout with clear pass/fail markers
+test_step() {
+	_TS_STATUS=$1
+	_TS_MSG=$2
+	_TS_TIMESTAMP=$(date '+%H:%M:%S')
+
+	case "$_TS_STATUS" in
+		PASS)    _TS_COLOUR="$_C_GREEN"    ;;
+		INFO)    _TS_COLOUR="$_C_BLUE"     ;;
+		WARN)    _TS_COLOUR="$_C_AMBER"    ;;
+		DRY-RUN) _TS_COLOUR="$_C_LAVENDER" ;;
+		ERROR)   _TS_COLOUR="$_C_RED"      ;;
+		FAIL)    _TS_COLOUR="$_C_ORANGE"   ;;
+		CHANGE)  _TS_COLOUR="$_C_GOLD"     ;;
+		*)       _TS_COLOUR="$_C_GREY"     ;;
+	esac
+
+	printf "  [%s] ${_TS_COLOUR}%-8s${_C_RESET} %s\n" \
+		"$_TS_TIMESTAMP" "$_TS_STATUS" "$_TS_MSG"
+}
+
+test_pass() { TEST_PASS=$((TEST_PASS + 1)); test_step "PASS" "$1"; }
+test_fail() { TEST_FAIL=$((TEST_FAIL + 1)); test_step "FAIL" "$1"; }
+test_info() { test_step "INFO" "$1"; }
+test_warn() { test_step "WARN" "$1"; }
 
 
 # --- Dependency check ---------------------------------------------------------
@@ -716,124 +830,6 @@ release_lock() {
 trap release_lock EXIT
 
 
-# --- Logging ------------------------------------------------------------------
-
-# Colour helpers
-if [ -t 1 ]; then
-	_C_RESET=$(printf '\033[0m')
-	_C_BOLD=$(printf '\033[1m')
-	_C_DIM=$(printf '\033[2m')
-	_C_GREEN=$(printf '\033[32m')
-	_C_YELLOW=$(printf '\033[33m')
-	_C_RED=$(printf '\033[31m')
-	_C_CYAN=$(printf '\033[36m')
-	_C_WHITE=$(printf '\033[97m')
-else
-	_C_RESET=''
-	_C_BOLD=''
-	_C_DIM=''
-	_C_GREEN=''
-	_C_YELLOW=''
-	_C_RED=''
-	_C_CYAN=''
-	_C_WHITE=''
-fi
-
-# Print a section header
-# Usage: status_section "TUNNELS"
-status_section() {
-	printf "\n${_C_BOLD}${_C_WHITE}  ── %s %s${_C_RESET}\n" "$1" \
-		"$(printf '%.0s─' $(seq 1 $((42 - ${#1}))))"
-}
-
-# Print a labelled status row, with optional colour applied to the value
-# Usage: status_row "Label" "value" [colour]
-status_row() {
-	_SR_LABEL=$1
-	_SR_VALUE=$2
-	_SR_COLOUR=${3:-}
-	printf "  ${_C_DIM}%-14s${_C_RESET} ${_SR_COLOUR}%s${_C_RESET}\n" "$_SR_LABEL" "$_SR_VALUE"
-}
-
-# Coloured ok/warn/err badges for inline use
-badge_ok()   { printf "${_C_GREEN}%s${_C_RESET}" "$1"; }
-badge_warn() { printf "${_C_YELLOW}%s${_C_RESET}" "$1"; }
-badge_err()  { printf "${_C_RED}%s${_C_RESET}" "$1"; }
-
-log() {
-	LEVEL=$1
-	MSG=$2
-	[ "$LOG_LEVEL" -lt "$LEVEL" ] && return
-	[ -z "$LOG_FILE" ] && return
-
-	TIME_ONLY=$(date '+%H:%M:%S')
-	FULL_TS=$(date '+%Y-%m-%d %H:%M:%S')
-
-	# Don't write to log file in dry-run or exercise mode — stdout only
-	if [ "$DRY_RUN" = "0" ] && [ "$FLAG_EXERCISE" = "0" ]; then
-		if [ -f "$LOG_FILE" ]; then
-			SIZE=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
-			if [ "$SIZE" -gt "$LOG_MAX_SIZE" ]; then
-				if [ "${LOG_MAX_LINES:-0}" -gt 0 ]; then
-					# Trim to last LOG_MAX_LINES lines via tmp file
-					_LOG_TMP=$(mktemp /tmp/wglog.XXXXXX)
-					tail -n "$LOG_MAX_LINES" "$LOG_FILE" > "$_LOG_TMP" 2>/dev/null
-					echo "[$FULL_TS] [INFO] Log trimmed to last ${LOG_MAX_LINES} lines (exceeded ${LOG_MAX_SIZE} bytes)" >> "$_LOG_TMP"
-					mv "$_LOG_TMP" "$LOG_FILE"
-				else
-					echo "[$FULL_TS] [INFO] Log rotated (exceeded ${LOG_MAX_SIZE} bytes)" > "$LOG_FILE"
-				fi
-			fi
-		fi
-		echo "[$FULL_TS] $MSG" >> "$LOG_FILE"
-	fi
-
-	if [ -n "$INTERACTIVE" ]; then
-		# Strip existing [INFO]/[CHANGE] prefix into a STATUS column
-		STATUS=$(printf "%s" "$MSG" | sed -n 's/^\[\([^]]*\)\][ ]*//p')
-		if [ -n "$STATUS" ]; then
-			PREFIX=$(printf "%s" "$MSG" | sed -n 's/^\[\([^]]*\)\].*/\1/p')
-			test_step "$PREFIX" "$STATUS"
-		else
-			test_step "LOG" "$MSG"
-		fi
-	fi
-}
-
-log_info()    { log 2 "[INFO]   $1"; }
-log_change()  { log 1 "[CHANGE] $1"; }
-log_error()   { log 1 "[ERROR]  $1"; }
-log_warn()    { log 1 "[WARN]   $1"; }
-log_verbose() { log 3 "[DEBUG]  $1"; }
-log_dryrun()  {
-	TIME_ONLY=$(date '+%H:%M:%S')
-	printf "  [%s] ${_C_YELLOW}%-8s${_C_RESET} %s\n" "$TIME_ONLY" "DRY-RUN" "$1"
-}
-
-# Exercise-mode step logger — always prints to stdout with clear pass/fail markers
-test_step() {
-	_TS_STATUS=$1
-	_TS_MSG=$2
-	_TS_TIMESTAMP=$(date '+%H:%M:%S')
-
-	case "$_TS_STATUS" in
-		PASS|INFO)   _TS_COLOUR="$_C_GREEN"  ;;
-		WARN|DRY-RUN) _TS_COLOUR="$_C_YELLOW" ;;
-		ERROR|FAIL)  _TS_COLOUR="$_C_RED"    ;;
-		CHANGE)      _TS_COLOUR="$_C_CYAN"   ;;
-		*)           _TS_COLOUR="$_C_DIM"    ;;
-	esac
-
-	printf "  [%s] ${_TS_COLOUR}%-8s${_C_RESET} %s\n" \
-		"$_TS_TIMESTAMP" "$_TS_STATUS" "$_TS_MSG"
-}
-
-test_pass() { TEST_PASS=$((TEST_PASS + 1)); test_step "PASS" "$1"; }
-test_fail() { TEST_FAIL=$((TEST_FAIL + 1)); test_step "FAIL" "$1"; }
-test_info() { test_step "INFO" "$1"; }
-test_warn() { test_step "WARN" "$1"; }
-
-
 # --- Webhook ------------------------------------------------------------------
 
 # URL-encode a string for safe use in GET query parameters.
@@ -1103,7 +1099,7 @@ wait_for_api_switch() {
 }
 
 
-# --- WAN pre-flight check -----------------------------------------------------
+# --- WAN check -----------------------------------------------------
 # Pings WAN_CHECK_TARGETS directly through the WAN interface (bypassing all
 # tunnels). Returns 0 if any target replies, 1 only if ALL targets fail.
 # A failure means the internet itself is down — failover would be pointless.
@@ -1684,9 +1680,9 @@ cmd_status() {
 			STATE_PEER=$(cat "${STATE_DIR}/${IFACE}.active" 2>/dev/null || echo "")
 			if [ -n "$STATE_PEER" ] && [ "$STATE_PEER" != "$ACTIVE_PEER" ]; then
 				STATE_NAME=$(get_peer_name "$STATE_PEER")
-				printf "  ${_C_YELLOW}  ⚠  DRIFT DETECTED: state file shows '%s' but router reports '%s'${_C_RESET}\n" \
+				printf "  ${_C_AMBER}  ⚠  DRIFT DETECTED: state file shows '%s' but router reports '%s'${_C_RESET}\n" \
 					"$STATE_NAME" "$ACTIVE_NAME"
-				printf "  ${_C_YELLOW}     Peer may have been changed externally — run 'reset' to clear.${_C_RESET}\n"
+				printf "  ${_C_AMBER}     Peer may have been changed externally — run 'reset' to clear.${_C_RESET}\n"
 			fi
 
 			status_row "Active peer" "${_C_CYAN}${_C_BOLD}${ACTIVE_NAME}${_C_RESET}  ${_C_DIM}(${ACTIVE_PEER})${_C_RESET}"
@@ -1701,7 +1697,7 @@ cmd_status() {
 					printf "    ${_C_CYAN}${_C_BOLD}►  %s  ${_C_DIM}(%s)${_C_RESET}\n" "$PNAME" "$PEER"
 				elif peer_in_cooldown "$IFACE" "$PEER"; then
 					REMAINING=$(get_cooldown_remaining "$IFACE" "$PEER")
-					printf "    ${_C_YELLOW}   %s  ${_C_DIM}(%s)${_C_RESET}${_C_YELLOW}  [cooldown: %ss]${_C_RESET}\n" \
+					printf "    ${_C_AMBER}   %s  ${_C_DIM}(%s)${_C_RESET}${_C_AMBER}  [cooldown: %ss]${_C_RESET}\n" \
 						"$PNAME" "$PEER" "$REMAINING"
 				else
 					printf "    ${_C_DIM}   %s  (%s)${_C_RESET}\n" "$PNAME" "$PEER"
@@ -1837,11 +1833,11 @@ cmd_status() {
 			case "$GLINET_API_STATUS" in
 				ok)
 					status_row "Reachable" "$(badge_ok 'YES')  ${_C_DIM}(${GLINET_ROUTER})${_C_RESET}"
+					status_row "User" "$GLINET_USER"
+					status_row "Salt / nonce" "${GLINET_API_SALT} / ${GLINET_API_NONCE}"
 					status_row "Login" "$([ "$GLINET_API_LOGIN_OK" = "true" ] \
 						&& badge_ok 'OK — credentials valid' \
 						|| badge_err 'FAILED — check GLINET_PASS')"
-					status_row "User" "$GLINET_USER"
-					status_row "Salt / nonce" "${GLINET_API_SALT} / ${GLINET_API_NONCE}"
 					;;
 				unreachable)
 					status_row "Reachable" "$(badge_err "NO — curl failed (rc=${GLINET_API_RC})")"
@@ -2239,7 +2235,7 @@ cmd_exercise() {
 	TEST_FAIL=0
 
 	echo ""
-	echo "============================================"
+	echo "==============================================="
 	echo "  wg_failover.sh v${VER} -- Exercise Mode"
 	echo "  $(date '+%Y-%m-%d %H:%M:%S')"
 	if [ -n "$FLAG_EXERCISE_IFACE" ]; then
@@ -2252,7 +2248,7 @@ cmd_exercise() {
 	[ "$FLAG_IGNORE_COOLDOWN" = "1" ] && echo "  Cooldown      : BYPASSED (--ignore-cooldown)"
 	[ "$DRY_RUN" = "1" ]             && echo "  Mode          : DRY RUN -- no real changes"
 	echo "  Note          : webhooks suppressed, log not written"
-	echo "============================================"
+	echo "==============================================="
 
 	BLANK_KEYWORD_SEEN=0
 	TUNNELS_TESTED=0
@@ -2297,7 +2293,7 @@ cmd_exercise() {
 		i=$((i + 1))
 	done
 
-	echo "============================================"
+	echo "==============================================="
 	echo "  Exercise Summary"
 	echo "  Tunnels tested : $TUNNELS_TESTED"
 	echo "  Checks passed  : $TEST_PASS"
@@ -2318,7 +2314,7 @@ cmd_exercise() {
 	else
 		echo "  Result         : FAILED ($TEST_FAIL check(s) did not pass)"
 	fi
-	echo "============================================"
+	echo "==============================================="
 	echo ""
 
 	[ "$TEST_FAIL" -gt 0 ] && exit 1
@@ -2334,7 +2330,7 @@ cmd_exercise() {
 
 cmd_force_rotate() {
 	echo ""
-	echo "========================================"
+	echo "==============================================="
 	echo "  wg_failover.sh v${VER} -- Force Rotate"
 	echo "  $(date '+%Y-%m-%d %H:%M:%S')"
 	if [ -n "$FLAG_FORCE_ROTATE_IFACE" ]; then
@@ -2345,8 +2341,8 @@ cmd_force_rotate() {
 		echo "  Scope         : all enabled tunnels"
 	fi
 	[ "$FLAG_IGNORE_COOLDOWN" = "1" ] && echo "  Cooldown      : BYPASSED (--ignore-cooldown)"
-	[ "$DRY_RUN" = "1" ]             && echo "  Mode          : DRY RUN -- no real changes"
-	echo "========================================"
+	[ "$DRY_RUN" = "1" ]              && echo "  Mode          : DRY RUN -- no real changes"
+	echo "==============================================="
 	echo ""
 
 	BLANK_KEYWORD_SEEN=0
@@ -2468,33 +2464,32 @@ if [ "$FLAG_FORCE_ROTATE" = "1" ]; then
 	exit 0
 fi
 
-# Dry-run / modifier banner for normal operation
-if [ "$DRY_RUN" = "1" ] || [ "$FLAG_FAIL" = "1" ] || [ "$FLAG_FAIL_WAN" = "1" ] || \
-   [ "$FLAG_REVERT" = "1" ] || [ "$FLAG_IGNORE_COOLDOWN" = "1" ]; then
+# Interactive banner for normal operation
+if [ "$INTERACTIVE" = "1" ]; then
 	echo ""
-	echo "========================================"
+	echo "==============================================="
 	echo "  wg_failover.sh v${VER}"
 	[ "$DRY_RUN" = "1" ] && echo "  Mode          : DRY RUN -- no changes will be made"
 	if [ "$FLAG_FAIL" = "1" ]; then
 		if [ -n "$FLAG_FAIL_IFACE" ]; then
-			echo "  Simulated fail: iface '${FLAG_FAIL_IFACE}'"
+			echo "  Simulated fail   : iface '${FLAG_FAIL_IFACE}'"
 		else
-			echo "  Simulated fail: label '${FLAG_FAIL_LABEL}'"
+			echo "  Simulated fail   : label '${FLAG_FAIL_LABEL}'"
 		fi
 	fi
-	[ "$FLAG_FAIL_WAN" = "1" ]        && echo "  WAN sim       : SIMULATED OUTAGE (--fail-wan)"
-	[ "$FLAG_REVERT" = "1" ]          && echo "  Revert        : YES -- will switch back after success"
-	[ "$FLAG_IGNORE_COOLDOWN" = "1" ] && echo "  Cooldown      : BYPASSED"
-	[ -n "$FLAG_SWITCH_METHOD" ]      && echo "  Switch meth   : ${FLAG_SWITCH_METHOD} (--switch-method override)"
+	[ "$FLAG_FAIL_WAN" = "1" ]        && echo "  WAN fail sim     : SIMULATED OUTAGE"
+	[ "$FLAG_REVERT" = "1" ]          && echo "  Revert on switch : YES -- will switch back after success"
+	[ "$FLAG_IGNORE_COOLDOWN" = "1" ] && echo "  Cooldown         : BYPASSED"
+	[ -n "$FLAG_SWITCH_METHOD" ]      && echo "  Switch method    : ${FLAG_SWITCH_METHOD}"
 	echo "  $(date '+%Y-%m-%d %H:%M:%S')"
-	echo "========================================"
+	echo "==============================================="
 	echo ""
 fi
 
 acquire_lock
 
-# Throttle check — skipped when --fail/--fail-wan/--dry-run/--exercise active
-if [ "$DRY_RUN" = "0" ] && [ "$FLAG_FAIL" = "0" ] && [ "$FLAG_FAIL_WAN" = "0" ] && [ "$FLAG_EXERCISE" = "0" ]; then
+# Throttle check — skipped when interactive
+if [ "$INTERACTIVE" = "0" ]; then
 	LAST_RUN_FILE="${STATE_DIR}/last_run"
 	NOW=$(date +%s)
 
@@ -2511,6 +2506,15 @@ fi
 
 # Remove cooldown files for peers that no longer exist in uci config
 cleanup_stale_cooldowns
+
+# WAN pre-flight check
+# If both --fail and --fail-wan are combined, simulate a WAN drop DURING the tunnel handshake check, not here.
+if wan_is_reachable || ( [ "$FLAG_FAIL" = "1" ] && [ "$FLAG_FAIL_WAN" = "1" ] ); then
+	log_info "WAN pre-flight: OK -- internet reachable via ${WAN_IFACE}"
+else
+	log_warn "WAN pre-flight: FAILED -- no connectivity via ${WAN_IFACE}, skipping all failovers this cycle"
+	exit 0
+fi
 
 DRYFLAG=""
 [ "$DRY_RUN" = "1" ]             && DRYFLAG="$DRYFLAG [DRY RUN]"
@@ -2662,23 +2666,21 @@ while [ "$i" -le "$TUNNEL_COUNT" ]; do
 	fi
 
 	# -------------------------------------------------------------------------
-	# WAN pre-flight check
+	# WAN check
 	# Stale handshake detected — before failing over, confirm the internet
-	# itself is reachable via WAN (bypassing all tunnels). If WAN has no
-	# connectivity the stale handshake is almost certainly an internet outage,
-	# not a dead VPN peer. Failover would exhaust and cooldown-lock all peers
-	# for no benefit. Skip this cycle and let the next cron run retry.
-	# Simulated failures (--fail) bypass this check so tests always run.
+	# itself is reachable via WAN (bypassing all tunnels). If not, skip.
 	# -------------------------------------------------------------------------
-	if [ "$SIMULATE_THIS" = "0" ]; then
-		if wan_is_reachable; then
-			send_wan_webhook "up"
-		else
-			log_warn "Tunnel '${LABEL}': handshake stale (${AGE}s) but WAN has no connectivity -- skipping failover (internet outage?)"
+	if ! wan_is_reachable; then
+		log_warn "Tunnel '${LABEL}': handshake stale (${AGE}s) but WAN has no connectivity -- skipping failover (internet outage?)"
+		
+		if [ "$SIMULATE_THIS" != "1" ]; then
 			send_wan_webhook "down"
-			i=$((i + 1))
-			continue
 		fi
+
+		i=$((i + 1))
+		continue
+	elif [ "$SIMULATE_THIS" != "1" ]; then
+		send_wan_webhook "up"
 	fi
 
 	# -------------------------------------------------------------------------
@@ -2717,10 +2719,10 @@ while [ "$i" -le "$TUNNEL_COUNT" ]; do
 
 		# Re-check WAN before each attempt — if connectivity dropped mid-failover,
 		# stop cycling peers rather than burning through the entire pool uselessly.
-		if [ "$SIMULATE_THIS" = "0" ] && ! wan_is_reachable; then
+		if ! wan_is_reachable; then
 			log_warn "Tunnel '${LABEL}': WAN connectivity lost mid-failover -- aborting peer cycle"
-			send_wan_webhook "down"
-			break
+			[ "$SIMULATE_THIS" = "1" ] || { send_wan_webhook "down"; }
+			break;
 		fi
 
 		NEXT_NAME=$(get_peer_name "$NEXT_PEER")
