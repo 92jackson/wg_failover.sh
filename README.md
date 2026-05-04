@@ -30,6 +30,7 @@ Failed servers enter a cooldown period to prevent rapid reuse. Tunnels are monit
 - **Post-switch verification** — Confirms traffic routing with primary and fallback ping targets
 - **Per-peer cooldown** — Avoids rapid reuse of recently failed servers
 - **Switch history** — Persistent per-tunnel log with configurable retention
+- **Optional peer benchmarking** — Optional current-peer throughput benchmarking per tunnel (download speed)
 - **Webhook notifications** — Alerts for failover, rotation, and WAN state changes
 - **GL.iNet dashboard sync** — Optional API integration to keep the router UI in sync after peer switches
 
@@ -62,7 +63,7 @@ Run the following commands on your router and note the output. You'll need these
 #### A) Identify WireGuard tunnel interfaces
 
 ```bash
-uci show network | grep 'wgclient.*\.config='
+uci show network | grep '\.config='
 ```
 
 Example output:
@@ -107,14 +108,6 @@ network.wgclient2.ip4table='1002'
 
 Use these values for `TUNNEL_X_ROUTE_TABLE`.
 
-#### D) Get the WAN interface
-
-```bash
-ip route show default | awk '{print $5}'
-```
-
-Use the output as `WAN_IFACE`.
-
 ### Step 3 — Configure the script
 
 Edit the script with your gathered values:
@@ -128,15 +121,13 @@ vi /usr/bin/wg_failover.sh
 ```bash
 # Tunnel 1
 TUNNEL_COUNT=1
+
 TUNNEL_1_IFACE='wgclient1'           # From Step 2A
 TUNNEL_1_WG_IF='wgclient1'           # From Step 2A
 TUNNEL_1_LABEL='Primary'             # Friendly name (free text)
 TUNNEL_1_KEYWORD='SetA'              # From Step 2B
 TUNNEL_1_ROUTE_TABLE='1001'          # From Step 2C
-TUNNEL_1_ENABLED=1
-
-# WAN
-WAN_IFACE='eth1'                     # From Step 2D
+TUNNEL_1_FAILOVER_ENABLED=1          # Monitor for failovers (0=disabled)
 ```
 
 See [Configuration Reference](#configuration-reference) for all available options including multiple tunnels, rotation schedules, and GL.iNet API integration.
@@ -166,7 +157,7 @@ tail -20 /var/log/wg_failover.log
 
 The script supports two methods for switching WireGuard peers, controlled by `GLINET_SWITCH_METHOD`.
 
-### Method 1 — UCI/ubus (default, works on all OpenWrt routers)
+### Method 1 — UCI/ubus (works on all OpenWrt routers)
 
 ```bash
 GLINET_SWITCH_METHOD='uci'
@@ -192,10 +183,10 @@ Performs the switch through the GL.iNet JSON-RPC API so the router dashboard and
 **Drawbacks:**
 
 - Requires storing your router admin password in the script — use `chmod 700 /usr/bin/wg_failover.sh` to restrict read access.
-- Slower than UCI switching — the API call involves a login/challenge/set/logout cycle (4 HTTP requests per switch).
+- Slower than UCI switching — the API path performs a challenge, login, tunnel lookup, switch, and logout sequence.
 - Only works on GL.iNet firmware 4.x. Setting `api` or `auto` on a non-GL.iNet router will fail and — if using `auto` — fall back to UCI.
 
-> **Recommendation:** Leave `GLINET_SWITCH_METHOD='uci'` unless you specifically need the dashboard to reflect automated switches. Set `auto` if you want best-effort dashboard sync with a safe fallback.
+> **Recommendation:** The script's default configuration is `GLINET_SWITCH_METHOD='auto'`, which attempts the GL.iNet API first and falls back to UCI if the API is unavailable or credentials are missing. If you don't need dashboard sync, set `uci` explicitly for the simplest and fastest behaviour.
 
 The switch method can also be overridden at runtime without editing the script:
 
@@ -212,25 +203,29 @@ The switch method can also be overridden at runtime without editing the script:
 Each tunnel can rotate to the next server on a schedule, independent of whether the current server is healthy. Both conditions can be set simultaneously — whichever triggers first wins.
 
 ```bash
-TUNNEL_1_ROTATE_INTERVAL=0        # Hours between forced rotations. 0 = disabled.
-TUNNEL_1_ROTATE_AT=''             # Time-of-day rotation in HH:MM 24-hour format. '' = disabled.
+TUNNEL_1_ROTATE=''                # Disabled
 ```
+
+`TUNNEL_X_ROTATE` accepts a comma-separated schedule:
+
+- `21600` = rotate every 21600 seconds (6 hours)
+- `03:00` = rotate daily at 03:00
+- `21600,03:00` = either trigger may rotate first
 
 **Examples:**
 
 ```bash
 # Rotate every 6 hours
-TUNNEL_1_ROTATE_INTERVAL=6
+TUNNEL_1_ROTATE='21600'
 
 # Rotate at 3am daily
-TUNNEL_1_ROTATE_AT='03:00'
+TUNNEL_1_ROTATE='03:00'
 
 # Both — whichever triggers first
-TUNNEL_1_ROTATE_INTERVAL=6
-TUNNEL_1_ROTATE_AT='03:00'
+TUNNEL_1_ROTATE='21600,03:00'
 ```
 
-A successful rotation sends a `rotated` webhook notification and is marked `[rotation]` in the log.
+A successful scheduled rotation sends a `rotated_scheduled` webhook notification and is marked `[rotation]` in the log. A manual `--force-rotate` sends `rotated_manual` on success.
 
 ---
 
@@ -255,7 +250,11 @@ The script is called automatically by cron every minute. No manual intervention 
 | ---------------------- | -------------------------------------------------------------------------------------------------- |
 | `status`               | Print tunnel status, handshake health, peer pool, cooldowns, rotation state, and a live ping test. |
 | `status --json`        | Same output as machine-readable JSON, suitable for scripting.                                      |
-| `reset`                | Clear all cooldowns, grace periods, rotation timestamps, and the run timer.                        |
+| `status --webhook`     | Send the current consolidated status snapshot to the configured webhook endpoint and exit.         |
+| `benchmarks`           | Print benchmark history summaries, including per-peer performance within each tunnel.              |
+| `benchmarks --json`    | Same benchmark summary as machine-readable JSON.                                                   |
+| `benchmarks --webhook` | Send the current benchmark summary to the configured webhook endpoint and exit.                    |
+| `reset`                | Clear all cooldowns, rotation timestamps, and the run timer.                                       |
 | `reset --keep-history` | Reset state but preserve switch history files.                                                     |
 
 ### Flags
@@ -268,11 +267,13 @@ All flags are composable and may appear in any order. Tunnel targeting accepts e
 | `--fail <label>`           | Treat the named tunnel as failed, triggering an immediate switch.                                           |
 | `--fail-wan`               | Simulate a WAN outage — failover is suppressed on all tunnels this run.                                     |
 | `--force-rotate [label]`   | Immediately rotate to the next peer without simulating a failure. Omit label to rotate all.                 |
+| `--benchmark [label]`      | Run a throughput benchmark on the current active peer. Omit label to benchmark all enabled tunnels.         |
 | `--exercise [label]`       | Run a full forward/return switch test. Reverts automatically. **Suppresses webhooks and log writes.**       |
 | `--revert`                 | After a successful switch, switch back to the original peer.                                                |
 | `--ignore-cooldown`        | Skip cooldown checks when selecting the next peer.                                                          |
 | `--switch-method <method>` | Override `GLINET_SWITCH_METHOD` for this run. Values: `auto` \| `api` \| `uci`.                             |
 | `--iface <iface>`          | Sub-qualifier for `--fail`, `--exercise`, and `--force-rotate` — target by interface name instead of label. |
+| `--debug`                  | Force verbose logging and send webhooks regardless of mode.                                                 |
 | `--version`                | Print version and exit.                                                                                     |
 
 The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisation.
@@ -284,6 +285,9 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 /usr/bin/wg_failover.sh status
 /usr/bin/wg_failover.sh status --json
 
+# Push a one-shot status snapshot to the configured webhook
+/usr/bin/wg_failover.sh status --webhook
+
 # Trace failover logic without making any changes
 /usr/bin/wg_failover.sh --dry-run
 
@@ -293,6 +297,16 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 # Force a rotation without simulating a failure
 /usr/bin/wg_failover.sh --force-rotate "Primary"
 /usr/bin/wg_failover.sh --force-rotate --iface wgclient1
+
+# Run current-peer benchmarks
+/usr/bin/wg_failover.sh --benchmark
+/usr/bin/wg_failover.sh --benchmark "Primary"
+/usr/bin/wg_failover.sh --benchmark --iface wgclient1
+
+# Print benchmark summaries
+/usr/bin/wg_failover.sh benchmarks
+/usr/bin/wg_failover.sh benchmarks --json
+/usr/bin/wg_failover.sh benchmarks --webhook
 
 # Simulate a WAN outage (failover suppressed on all tunnels)
 /usr/bin/wg_failover.sh --fail-wan
@@ -315,24 +329,32 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 
 ### Tunnel Definitions
 
-| Variable                   | Description                                                                   |
-| -------------------------- | ----------------------------------------------------------------------------- |
-| `TUNNEL_COUNT`             | Total number of tunnels defined below                                         |
-| `TUNNEL_X_IFACE`           | OpenWrt network interface name (e.g. `wgclient1`)                             |
-| `TUNNEL_X_WG_IF`           | WireGuard kernel interface name (usually same as `TUNNEL_X_IFACE`)            |
-| `TUNNEL_X_LABEL`           | Friendly name used in logs, webhooks, and flag targeting                      |
-| `TUNNEL_X_KEYWORD`         | Substring to match server names · blank = all unclaimed servers               |
-| `TUNNEL_X_ROUTE_TABLE`     | Routing table number for ping verification · blank = interface-bound fallback |
-| `TUNNEL_X_ENABLED`         | `1` = monitor · `0` = skip this tunnel                                        |
-| `TUNNEL_X_ROTATE_INTERVAL` | Hours between forced rotations · `0` = disabled                               |
-| `TUNNEL_X_ROTATE_AT`       | Time-of-day rotation as `HH:MM` · `''` = disabled                             |
+| Variable                    | Description                                                                                              |
+| --------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `TUNNEL_COUNT`              | Total number of tunnels defined below                                                                    |
+| `TUNNEL_X_IFACE`            | OpenWrt network interface name (e.g. `wgclient1`)                                                        |
+| `TUNNEL_X_WG_IF`            | WireGuard kernel interface name (usually same as `TUNNEL_X_IFACE`)                                       |
+| `TUNNEL_X_LABEL`            | Friendly name used in logs, webhooks, and flag targeting                                                 |
+| `TUNNEL_X_KEYWORD`          | Substring to match server names · blank = all unclaimed servers                                          |
+| `TUNNEL_X_ROUTE_TABLE`      | Routing table number for ping verification · blank = interface-bound fallback                            |
+| `TUNNEL_X_FAILOVER_ENABLED` | `1` = monitor for failover · `0` = skip this tunnel for failover                                         |
+| `TUNNEL_X_ROTATE`           | CSV rotation schedule. e.g. '21600' (secs), '03:00' (daily), '21600,03:00' (either) · `''` = no rotation |
+| `TUNNEL_X_BENCHMARK_URL`    | Optional benchmark test-file URL override for this tunnel · blank = use `BENCHMARK_URL`                  |
 
 ### WAN Safety Guard
 
-| Variable            | Description                                          | Default           |
-| ------------------- | ---------------------------------------------------- | ----------------- |
-| `WAN_IFACE`         | WAN interface for pre-flight checks · `''` = disable | `''`              |
-| `WAN_CHECK_TARGETS` | Space-separated IPs used to verify WAN reachability  | `1.1.1.1 8.8.8.8` |
+| Variable                  | Description                                                                                             | Default           |
+| ------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------- |
+| `WAN_IFACE`               | WAN interface override for ping checks · `''` = auto-detect via ubus                                    | `''`              |
+| `WAN_CHECK_VIA_TUNNEL`    | Ping via tunnels (use when kill switch is active) · `0` = directly via WAN interface, `1` = via tunnels | `0`               |
+| `WAN_PING_TARGETS`        | IPs to ping to confirm internet access · `''` = skip ping check                                         | `1.1.1.1 8.8.8.8` |
+| `WAN_STABILITY_THRESHOLD` | Min WAN uptime + confirmed internet access ping in seconds before acting on tunnel state · `0` = off    | `120`             |
+
+`WAN_CHECK_VIA_TUNNEL` is mainly for setups using the GL.iNet dashboard kill switch. In that mode, direct WAN pings may be blocked by policy even when the ISP connection is healthy, so a direct WAN probe can produce a false `wan_down` result. When enabled, the script checks connectivity through the configured tunnels instead and treats the first successful reply as proof that upstream internet access still exists.
+
+This requires more than one tunnel to be configured. With only a single tunnel, the script cannot reliably distinguish between “the WAN is down” and “the only tunnel is down”, because both conditions can look the same from the tunnel side, so tunnel-based WAN checking is not used in that case.
+
+If you use the kill switch with only one tunnel, consider setting `WAN_PING_TARGETS=''` so WAN safety relies only on the interface uptime report instead of tunnel-based reachability probes.
 
 ### GL.iNet Dashboard API
 
@@ -351,20 +373,18 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 | `PRE_FAILOVER_PING`             | Ping the current peer before failing over — skips switch if traffic is still flowing (`1` = yes, `0` = no) | `1`     |
 | `POST_SWITCH_HANDSHAKE_TIMEOUT` | Seconds to poll for a handshake after switching                                                            | `45`    |
 | `POST_SWITCH_DELAY`             | Seconds to wait before pinging if handshake poll times out                                                 | `20`    |
-| `POST_SWITCH_GRACE`             | Seconds of monitoring pause after a successful switch                                                      | `60`    |
 | `PEER_COOLDOWN`                 | Seconds before a failed server can be retried                                                              | `600`   |
 | `MAX_FAILOVER_ATTEMPTS`         | Max peers to try per cycle · `0` = try all                                                                 | `0`     |
 | `HANDSHAKE_POLL_INTERVAL`       | Seconds between handshake polls after switching                                                            | `3`     |
 
 ### Ping Verification
 
-| Variable               | Description                                          | Default   |
-| ---------------------- | ---------------------------------------------------- | --------- |
-| `PING_VERIFY`          | Enable ping verification after switching (`1` = yes) | `1`       |
-| `PING_TARGET`          | Primary IP to ping for post-switch verification      | `1.1.1.1` |
-| `PING_TARGET_FALLBACK` | Secondary ping target if primary fails               | `8.8.8.8` |
-| `PING_COUNT`           | Packets per ping test                                | `3`       |
-| `PING_TIMEOUT`         | Seconds per ping reply                               | `5`       |
+| Variable       | Description                                                      | Default           |
+| -------------- | ---------------------------------------------------------------- | ----------------- |
+| `PING_VERIFY`  | Enable ping verification after switching (`1` = yes)             | `1`               |
+| `PING_TARGETS` | Space-separated IPs to ping through tunnel. First success = pass | `1.1.1.1 8.8.8.8` |
+| `PING_COUNT`   | Packets per ping test                                            | `3`               |
+| `PING_TIMEOUT` | Seconds per ping reply                                           | `5`               |
 
 ### Logging
 
@@ -377,13 +397,24 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 | `HISTORY_MAX_LINES` | Max switch history entries per tunnel · `0` = unlimited  | `500`                      |
 | `STATE_DIR`         | Directory for runtime state files and lockfile           | `/tmp/wg_failover`         |
 
+### Benchmarking
+
+| Variable                      | Description                                                                             | Default                                   |
+| ----------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `BENCHMARK_URL`               | Default public test-file URL used for throughput benchmarking                           | `https://ash-speed.hetzner.com/100MB.bin` |
+| `BENCHMARK_TIMEOUT`           | Max seconds per benchmark request                                                       | `30`                                      |
+| `BENCHMARK_HISTORY_MAX_LINES` | Max benchmark history entries per tunnel                                                | `200`                                     |
+| `BENCHMARK_INTERVAL`          | CSV schedule for periodic current-peer benchmarks. e.g. `21600`, `03:00`, `21600,03:00` | `''`                                      |
+| `BENCHMARK_INTERVAL_WEBHOOK`  | `1` = send a benchmark webhook after a scheduled benchmark run, `0` = do not            | `0`                                       |
+
 ### Webhook Notifications
 
-| Variable               | Description                                         | Default |
-| ---------------------- | --------------------------------------------------- | ------- |
-| `WEBHOOK_URL`          | Notification endpoint · `''` = disable              | `''`    |
-| `WEBHOOK_METHOD`       | `GET` appends query params · `POST` sends JSON body | `GET`   |
-| `WAN_WEBHOOK_INTERVAL` | Minimum seconds between repeated `wan_down` alerts  | `300`   |
+| Variable                  | Description                                                                                       | Default |
+| ------------------------- | ------------------------------------------------------------------------------------------------- | ------- |
+| `WEBHOOK_URL`             | Notification endpoint · `''` = disable                                                            | `''`    |
+| `WEBHOOK_PROCESSOR`       | GET = `''` · POST: `'text'` (plain text), `'json'`, `'ntfy'`, `'gotify'`                          | `''`    |
+| `WEBHOOK_REPEAT_INTERVAL` | Minimum seconds before the same event fires again on the same tunnel                              | `300`   |
+| `STATUS_WEBHOOK_INTERVAL` | CSV schedule for periodic status webhooks. e.g. '21600' (sec), '06:00,18:00', '21600,06:00,18:00' | ''      |
 
 ---
 
@@ -391,52 +422,99 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 
 Set `WEBHOOK_URL` to receive a notification on failover, rotation, or WAN state changes.
 
-### ntfy.sh (cloud-hosted, GET)
+### Methods
 
-```bash
-WEBHOOK_URL='https://ntfy.sh/your-topic-name'
-WEBHOOK_METHOD='GET'
+#### GET (default, `''`)
+
+Parameters are appended as query strings. Fields vary by event type:
+
+```
+# Standard events (switched_failover, rotated_scheduled, rotated_manual,
+# failover_ping_failed, rotation_ping_failed)
+{WEBHOOK_URL}?tunnel=Streaming&from=UK-01&to=Albania-58&status=switched_failover
+
+# All peers exhausted (no destination peer)
+{WEBHOOK_URL}?tunnel=Streaming&from=UK-01&status=all_failed
+
+# WAN events (not tunnel-specific)
+{WEBHOOK_URL}?status=wan_down
+{WEBHOOK_URL}?status=wan_up
 ```
 
-When using `GET`, parameters are appended as query strings: `?tunnel=...&from=...&to=...&status=...`
+#### Plain Text (`'text'`)
 
-### Gotify (self-hosted, POST)
+POSTs a human-readable string:
 
-```bash
-WEBHOOK_URL='https://your-gotify-server/message?token=YOUR_APP_TOKEN'
-WEBHOOK_METHOD='POST'
 ```
-
-> **Note:** Gotify expects `title`, `message`, and `priority` fields. The script sends its own payload structure — the notification will appear with a blank title in the Gotify UI. To fix this, modify the `send_webhook` function in the script to use Gotify's expected format.
-
-### Custom Endpoint (POST)
+Streaming - failover from UK-01 to Albania-58
+WAN offline
+```
 
 ```bash
 WEBHOOK_URL='https://yourserver.com/webhook'
-WEBHOOK_METHOD='POST'
+WEBHOOK_PROCESSOR='text'
 ```
 
-POST payload:
+#### JSON (`'json'`)
+
+POSTs a JSON body. Fields vary by event type:
 
 ```json
-{
-  "tunnel": "Primary (Set A)",
-  "from": "Provider-SetA-Server1",
-  "to": "Provider-SetA-Server2",
-  "status": "switched"
-}
+// Standard events (switched_failover, rotated_scheduled, rotated_manual,
+// failover_ping_failed, rotation_ping_failed)
+{ "tunnel": "Streaming", "from": "UK-01", "to": "Albania-58", "status": "switched_failover" }
+
+// All peers exhausted (no destination peer)
+{ "tunnel": "Streaming", "from": "UK-01", "status": "all_failed" }
+
+// WAN events (not tunnel-specific)
+{ "status": "wan_down" }
+{ "status": "wan_up" }
 ```
+
+```bash
+WEBHOOK_URL='https://yourserver.com/webhook'
+WEBHOOK_PROCESSOR='json'
+```
+
+#### ntfy (`'ntfy'`)
+
+POSTs to an [ntfy](https://ntfy.sh) topic with title, priority and tags derived from the event type.
+
+```bash
+WEBHOOK_URL='https://ntfy.sh/your-topic-name'
+WEBHOOK_PROCESSOR='ntfy'
+```
+
+#### Gotify (`'gotify'`)
+
+POSTs a JSON body with `title`, `message`, and `priority` mapped per event type. Include your app token in the URL.
+
+```bash
+WEBHOOK_URL='https://your-gotify-server/message?token=YOUR_APP_TOKEN'
+WEBHOOK_PROCESSOR='gotify'
+```
+
+---
 
 ### Status Values
 
-| Status        | Meaning                                                                            |
-| ------------- | ---------------------------------------------------------------------------------- |
-| `switched`    | Failover successful — new server verified                                          |
-| `rotated`     | Scheduled rotation successful — new server verified                                |
-| `ping_failed` | Switched to new server but ping verification failed                                |
-| `all_failed`  | All servers in the pool are exhausted or in cooldown                               |
-| `wan_down`    | WAN outage detected; failover suppressed (rate-limited per `WAN_WEBHOOK_INTERVAL`) |
-| `wan_up`      | WAN restored after a `wan_down` event                                              |
+| Status                  | Meaning                                                                 |
+| ----------------------- | ----------------------------------------------------------------------- |
+| `switched_failover`     | Failover successful — new peer verified                                 |
+| `switched_revert`       | Reverted to original peer after --revert                                |
+| `rotated_scheduled`     | Scheduled rotation successful — new peer verified                       |
+| `rotated_manual`        | Manual force-rotate successful — new peer verified                      |
+| `failover_ping_failed`  | A candidate peer failed ping verification during failover — trying next |
+| `rotation_ping_failed`  | Rotation target failed ping verification — staying on current peer      |
+| `all_failed`            | All peers exhausted or in cooldown — cannot failover                    |
+| `wan_down`              | WAN outage detected; failover suppressed while WAN is down              |
+| `wan_up`                | WAN restored after a `wan_down` event                                   |
+| `tunnel_down`           | Tunnel interface is not up, monitoring skipped this cycle               |
+| `single_peer`           | Only one peer in pool, failover not possible                            |
+| `rotation_all_cooldown` | All peers in cooldown, scheduled rotation skipped                       |
+| `all_failed_wan_lost`   | WAN lost mid-failover, peer cycle aborted — no working peer guaranteed  |
+| `ping_failed`           | Manual `--force-rotate` target failed ping verification                 |
 
 ---
 
@@ -512,10 +590,6 @@ If only the interface-bound method works, set `TUNNEL_X_ROUTE_TABLE=''` in the s
 ### False positive failovers
 
 Increase `HANDSHAKE_TIMEOUT` to `240` or `300`. WireGuard re-handshakes roughly every 3 minutes but this can occasionally stretch longer on congested connections.
-
-### A tunnel is off but the script still monitors it
-
-The script checks whether each interface is administratively up before monitoring — if you disable a tunnel interface it will be skipped automatically. You can also set `TUNNEL_X_ENABLED=0` to permanently exclude a tunnel without removing its configuration.
 
 ### GL.iNet API switch fails
 
