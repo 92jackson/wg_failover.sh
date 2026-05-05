@@ -1,6 +1,6 @@
 #!/bin/sh
 # =================================================================================
-VER='2.1.0'
+VER='2.1.1'
 # WireGuard VPN Tunnel Failover and Auto-Rotate for OpenWrt
 #
 # GitHub : https://github.com/92jackson/wg_failover.sh
@@ -119,7 +119,7 @@ TUNNEL_1_WG_IF='wgclient1'         # WireGuard kernel interface (usually same as
 TUNNEL_1_LABEL='Primary'           # Friendly name for logs/webhooks (free text)
 TUNNEL_1_KEYWORD=''                # (2) Substring matching this tunnel's peers. '' = all unallocated peers
 TUNNEL_1_ROUTE_TABLE='1001'        # (3) Routing table
-TUNNEL_1_FAILOVER_ENABLED=1        # 1=script monitors tunnel for failover, 0=ignore
+TUNNEL_1_FAILOVER_ENABLED=1        # 1 = Script monitors tunnel for failover
 TUNNEL_1_ROTATE=''                 # CSV rotation schedule. e.g. '21600' (secs) | '03:00' (daily) | '21600,03:00' (either)
 TUNNEL_1_BENCHMARK_URL=''          # Optional benchmark URL override. '' = use global BENCHMARK_URL
 
@@ -237,7 +237,7 @@ BENCHMARK_URL='https://ash-speed.hetzner.com/100MB.bin' # Default test file URL
 BENCHMARK_TIMEOUT=30                                    # Max seconds per benchmark request
 BENCHMARK_HISTORY_MAX_LINES=200                         # Per-tunnel benchmark history retention
 BENCHMARK_INTERVAL=''                                   # CSV schedule. e.g. '21600' | '03:00' | '21600,03:00'
-BENCHMARK_INTERVAL_WEBHOOK=0                            # 1=send webhook after scheduled benchmark run, 0=do not
+BENCHMARK_INTERVAL_WEBHOOK=0                            # 0=disabled, 1=send after every run, -1=send only on last interval CSV entry
 
 # =================================================================================
 # =================================================================================
@@ -277,7 +277,7 @@ TEST_PASS=0
 TEST_FAIL=0
 FLAG_DEBUG=0
 FLAG_CHECK_UPDATE=0
-
+SCHEDULE_TRIGGERED_ENTRY=""
 
 # --- Argument parsing ---------------------------------------------------------
 # Subcommands: status, benchmarks, reset
@@ -755,6 +755,18 @@ validate_config() {
 		esac
 	}
 
+	validate_benchmark_webhook_mode() {
+		_VBW_NAME=$1
+		_VBW_VALUE=$2
+		case "$_VBW_VALUE" in
+			0|1|-1) return 0 ;;
+			*)
+				echo "Error: ${_VBW_NAME} must be 0, 1, or -1 (got: '${_VBW_VALUE:-<empty>}')"
+				return 1
+				;;
+		esac
+	}
+
 	validate_non_negative_int() {
 		_VN_NAME=$1
 		_VN_VALUE=$2
@@ -841,6 +853,7 @@ validate_config() {
 	validate_bool_01 "PRIVACY_ROUTE_VIA_TUNNEL" "${PRIVACY_ROUTE_VIA_TUNNEL:-0}" || exit 1
 	validate_bool_01 "PRE_FAILOVER_PING" "${PRE_FAILOVER_PING:-0}" || exit 1
 	validate_bool_01 "PING_VERIFY" "${PING_VERIFY:-0}" || exit 1
+	validate_benchmark_webhook_mode "BENCHMARK_INTERVAL_WEBHOOK" "${BENCHMARK_INTERVAL_WEBHOOK:-0}" || exit 1
 	validate_non_negative_int "WAN_STABILITY_THRESHOLD" "${WAN_STABILITY_THRESHOLD:-0}" || exit 1
 	validate_non_negative_int "HANDSHAKE_TIMEOUT" "${HANDSHAKE_TIMEOUT:-0}" || exit 1
 	validate_non_negative_int "POST_SWITCH_HANDSHAKE_TIMEOUT" "${POST_SWITCH_HANDSHAKE_TIMEOUT:-0}" || exit 1
@@ -2280,24 +2293,23 @@ schedule_due() {
 		[ -z "$_SD_ENTRY" ] && continue
 		case "$_SD_ENTRY" in
 			*:*)
-				# HH:MM time-of-day — guard against re-firing within 1h
 				if [ "$_SD_CURRENT_TIME" = "$_SD_ENTRY" ] && [ "$_SD_ELAPSED" -gt 3600 ]; then
 					log_verbose "Schedule '${_SD_LABEL}': due (time-of-day ${_SD_ENTRY} matched)"
-					echo "due" > "$_SD_TMP"
+					echo "$_SD_ENTRY" > "$_SD_TMP"
 				fi
 				;;
 			*)
-				# Integer seconds interval
 				if [ "$_SD_ELAPSED" -ge "$_SD_ENTRY" ] 2>/dev/null; then
 					log_verbose "Schedule '${_SD_LABEL}': due (interval $(format_duration "$_SD_ENTRY") elapsed)"
-					echo "due" > "$_SD_TMP"
+					echo "$_SD_ENTRY" > "$_SD_TMP"
 				fi
 				;;
 		esac
 	done
-	_SD_RESULT=$(cat "$_SD_TMP" 2>/dev/null)
+	_SD_TRIGGERED=$(cat "$_SD_TMP" 2>/dev/null)
 	rm -f "$_SD_TMP"
-	[ "$_SD_RESULT" = "due" ] && return 0
+	[ -n "$_SD_TRIGGERED" ] && SCHEDULE_TRIGGERED_ENTRY="$_SD_TRIGGERED" && return 0
+	SCHEDULE_TRIGGERED_ENTRY=""
 	return 1
 }
 
@@ -2366,6 +2378,14 @@ schedule_next_due() {
 
 	[ "$_SND_OVERDUE" -eq 1 ] && { printf 'overdue'; return; }
 	[ -n "$_SND_BEST_TEXT" ] && printf '%s' "$_SND_BEST_TEXT"
+}
+
+# Returns 0 if $1 is the last non-empty entry in CSV $2
+schedule_is_last_entry() {
+	_SIL_ENTRY=$1
+	_SIL_CSV=$2
+	_SIL_LAST=$(printf '%s\n' "$_SIL_CSV" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | tail -n1)
+	[ "$_SIL_ENTRY" = "$_SIL_LAST" ]
 }
 
 # Selects the next peer in sequential pool order for rotation.
@@ -4669,11 +4689,23 @@ if [ -n "$BENCHMARK_INTERVAL" ] && [ -n "$BENCHMARK_URL" ] && \
 		done
 		echo "$(date +%s)" > "$_PBW_TS_FILE"
 
-		if [ "${BENCHMARK_INTERVAL_WEBHOOK:-0}" = "1" ]; then
+		_BIW="${BENCHMARK_INTERVAL_WEBHOOK:-0}"
+		_BIW_SEND=0
+		if [ "$_BIW" = "1" ]; then
+			_BIW_SEND=1
+		elif [ "$_BIW" = "-1" ]; then
+			if schedule_is_last_entry "$SCHEDULE_TRIGGERED_ENTRY" "$BENCHMARK_INTERVAL"; then
+				_BIW_SEND=1
+				log_verbose "Periodic benchmark: BENCHMARK_INTERVAL_WEBHOOK=-1 and last entry matched -- sending webhook"
+			else
+				log_verbose "Periodic benchmark: BENCHMARK_INTERVAL_WEBHOOK=-1 but '${SCHEDULE_TRIGGERED_ENTRY}' is not last entry -- skipping webhook"
+			fi
+		fi
+		if [ "$_BIW_SEND" = "1" ]; then
 			if [ -n "$WEBHOOK_URL" ]; then
 				send_benchmarks_webhook
 			else
-				log_verbose "Periodic benchmark: BENCHMARK_INTERVAL_WEBHOOK=1 but WEBHOOK_URL is not set -- skipping webhook"
+				log_verbose "Periodic benchmark: webhook enabled but WEBHOOK_URL is not set -- skipping"
 			fi
 		fi
 	fi
