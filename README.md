@@ -411,7 +411,7 @@ Only use this setting if you are running a privacy-conscious setup.
 | `BENCHMARK_TIMEOUT`           | Max seconds per benchmark request                                                       | `30`                                      |
 | `BENCHMARK_HISTORY_MAX_LINES` | Max benchmark history entries per tunnel                                                | `200`                                     |
 | `BENCHMARK_INTERVAL`          | CSV schedule for periodic current-peer benchmarks. e.g. `21600`, `03:00`, `21600,03:00` | `''`                                      |
-| `BENCHMARK_INTERVAL_WEBHOOK`  | `1` = send a benchmark webhook after a scheduled benchmark run, `0` = do not            | `0`                                       |
+| `BENCHMARK_INTERVAL_WEBHOOK`  | `0` = disabled, `1` = send webhook every interval, `-1` = send only last interval       | `0`                                       |
 
 ### Webhook Notifications
 
