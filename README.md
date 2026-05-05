@@ -275,6 +275,7 @@ All flags are composable and may appear in any order. Tunnel targeting accepts e
 | `--iface <iface>`          | Sub-qualifier for `--fail`, `--exercise`, and `--force-rotate` — target by interface name instead of label. |
 | `--debug`                  | Force verbose logging and send webhooks regardless of mode.                                                 |
 | `--version`                | Print version and exit.                                                                                     |
+| `--check-update`           | Check for updates and exit.                                                                                 |
 
 The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisation.
 
@@ -343,18 +344,23 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 
 ### WAN Safety Guard
 
-| Variable                  | Description                                                                                             | Default           |
-| ------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------- |
-| `WAN_IFACE`               | WAN interface override for ping checks · `''` = auto-detect via ubus                                    | `''`              |
-| `WAN_CHECK_VIA_TUNNEL`    | Ping via tunnels (use when kill switch is active) · `0` = directly via WAN interface, `1` = via tunnels | `0`               |
-| `WAN_PING_TARGETS`        | IPs to ping to confirm internet access · `''` = skip ping check                                         | `1.1.1.1 8.8.8.8` |
-| `WAN_STABILITY_THRESHOLD` | Min WAN uptime + confirmed internet access ping in seconds before acting on tunnel state · `0` = off    | `120`             |
+| Variable                  | Description                                                                                          | Default           |
+| ------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------- |
+| `WAN_IFACE`               | WAN interface override for ping checks · `''` = auto-detect via ubus                                 | `''`              |
+| `WAN_PING_TARGETS`        | IPs to ping to confirm internet access · `''` = skip ping check                                      | `1.1.1.1 8.8.8.8` |
+| `WAN_STABILITY_THRESHOLD` | Min WAN uptime + confirmed internet access ping in seconds before acting on tunnel state · `0` = off | `120`             |
 
-`WAN_CHECK_VIA_TUNNEL` is mainly for setups using the GL.iNet dashboard kill switch. In that mode, direct WAN pings may be blocked by policy even when the ISP connection is healthy, so a direct WAN probe can produce a false `wan_down` result. When enabled, the script checks connectivity through the configured tunnels instead and treats the first successful reply as proof that upstream internet access still exists.
+### Privacy Settings
 
-This requires more than one tunnel to be configured. With only a single tunnel, the script cannot reliably distinguish between “the WAN is down” and “the only tunnel is down”, because both conditions can look the same from the tunnel side, so tunnel-based WAN checking is not used in that case.
+| Variable                   | Description                                                        | Default |
+| -------------------------- | ------------------------------------------------------------------ | ------- |
+| `PRIVACY_ROUTE_VIA_TUNNEL` | Route non-local outbound traffic via tunnels · `0` = off, `1` = on | `0`     |
 
-If you use the kill switch with only one tunnel, consider setting `WAN_PING_TARGETS=''` so WAN safety relies only on the interface uptime report instead of tunnel-based reachability probes.
+`PRIVACY_ROUTE_VIA_TUNNEL` prevents IP leakage by routing non-local outbound traffic via tunnels. This includes update webhooks, WAN reachability, and update checks (benchmarking, and tunnel PING testing is already directed over tunnels).
+
+If using this setting and you only have a single tunnel defined, WAN ping checks are bypassed as the script will not be able to distinguish WAN outage from tunnel failure. In that case, WAN stability relies on WAN interface uptime only.
+
+Only use this setting if you are running a privacy-conscious setup.
 
 ### GL.iNet Dashboard API
 
