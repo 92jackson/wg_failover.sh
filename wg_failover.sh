@@ -1,6 +1,6 @@
 #!/bin/sh
 # =================================================================================
-VER='2.0.0'
+VER='2.1.0'
 # WireGuard VPN Tunnel Failover and Auto-Rotate for OpenWrt
 #
 # GitHub : https://github.com/92jackson/wg_failover.sh
@@ -65,6 +65,8 @@ VER='2.0.0'
 #                               values: auto | api | uci
 #   --debug                   — force verbose logging and send webhooks regardless of mode
 #   --version                 — print version and exit
+#   --check-update            — check for updates and exit
+#
 #
 #   --iface <iface>           — use interface name in place of label
 #                               ex. --force-rotate --iface wgclient1
@@ -89,13 +91,12 @@ VER='2.0.0'
 # REQUIRED:
 #   • Configure your TUNNELS DEFINITIONS (script will not run correctly without it)
 #
-# OPTIONAL BUT STRONGLY RECOMMENDED:
-#   • WAN SAFETY GUARD → prevents exhausting peers during ISP outages
-#
 # OPTIONAL:
+#   • WAN Safety Guard (prevents exhausting peers during ISP outages)
+#   • Privacy routing (when sending WAN health checks and optional webhooks)
 #   • GL.iNet API integration
 #   • Failover timer tuning
-#   • Logging, webhooks, rotation, etc.
+#   • Logging, webhook notifications, rotation, etc.
 # =============================================================================
 
 
@@ -139,9 +140,21 @@ TUNNEL_1_BENCHMARK_URL=''          # Optional benchmark URL override. '' = use g
 # =============================================================================
 
 WAN_IFACE=''                          # WAN interface override. '' = auto-detect via ubus
-WAN_CHECK_VIA_TUNNEL=0                # 0 = ping directly via WAN interface, 1 = ping via tunnels (use when kill switch is active)
 WAN_PING_TARGETS='1.1.1.1 8.8.8.8'    # Ping targets to confirm internet access. '' = skip ping check
 WAN_STABILITY_THRESHOLD=120           # Min WAN uptime (seconds) before acting on tunnel state. 0 = disabled
+
+
+# =============================================================================
+# PRIVACY ROUTING (OPTIONAL)
+# Routes non-local outbound traffic via tunnels where possible.
+# Affects update checks, webhooks, and WAN reachability checks.
+# If no usable tunnel exists, privacy-routed requests fail instead of falling back.
+# If enabled with only 1 tunnel defined, WAN ping checks are bypassed because the
+# script cannot distinguish WAN outage from tunnel failure in that setup. In that
+# case, WAN stability relies on WAN interface uptime only.
+# =============================================================================
+
+PRIVACY_ROUTE_VIA_TUNNEL=0            # 1 = route non-local outbound traffic via tunnels
 
 
 # =============================================================================
@@ -233,6 +246,7 @@ BENCHMARK_INTERVAL_WEBHOOK=0                            # 1=send webhook after s
 # =================================================================================
 
 
+
 # --- Globals ------------------------------------------------------------------
 
 DRY_RUN=0
@@ -262,6 +276,7 @@ INTERACTIVE=''
 TEST_PASS=0
 TEST_FAIL=0
 FLAG_DEBUG=0
+FLAG_CHECK_UPDATE=0
 
 
 # --- Argument parsing ---------------------------------------------------------
@@ -398,6 +413,11 @@ parse_args() {
 				INTERACTIVE=1
 				shift
 				;;
+			--check-update)
+				FLAG_CHECK_UPDATE=1
+				INTERACTIVE=1
+				shift
+				;;
 			status)
 				SUBCOMMAND="$1"
 				shift
@@ -439,11 +459,10 @@ parse_args() {
 				;;
 			*)
 				echo "Unknown argument: $1"
-				echo "Usage: $0 [status [--json|--webhook]|benchmarks [--json|--webhook]|reset [--keep-history]] [--dry-run] [--version] [--debug]"
+				echo "Usage: $0 [status [--json|--webhook]|benchmarks [--json|--webhook]|reset [--keep-history]] [--dry-run] [--version] [--debug] [--check-update]"
 				echo "          [--fail [--iface] <target>] [--fail-wan]"
 				echo "          [--exercise [--iface] [target]] [--force-rotate [--iface] [target]]"
 				echo "          [--benchmark [--iface] [target]]"
-				echo "          [--revert] [--ignore-cooldown] [--switch-method auto|api|uci]"
 				exit 1
 				;;
 		esac
@@ -624,6 +643,96 @@ check_dependencies() {
 	fi
 }
 
+resolve_privacy_route_config() {
+	if [ "${PRIVACY_ROUTE_VIA_TUNNEL+x}" != "x" ]; then
+		PRIVACY_ROUTE_VIA_TUNNEL="${PRIVACY_ROUTE_VIA_TUNNEL:-0}"
+	elif [ "${WAN_CHECK_VIA_TUNNEL+x}" = "x" ]; then
+		PRIVACY_ROUTE_VIA_TUNNEL="${WAN_CHECK_VIA_TUNNEL:-0}"
+	else
+		PRIVACY_ROUTE_VIA_TUNNEL=0
+	fi
+}
+
+privacy_route_enabled() {
+	[ "${PRIVACY_ROUTE_VIA_TUNNEL:-0}" = "1" ]
+}
+
+external_curl() {
+	if ! privacy_route_enabled; then
+		curl "$@"
+		return $?
+	fi
+
+	_EC_i=1
+	while [ "$_EC_i" -le "$TUNNEL_COUNT" ]; do
+		eval "_EC_IFACE=\$TUNNEL_${_EC_i}_IFACE"
+		eval "_EC_WG_IF=\$TUNNEL_${_EC_i}_WG_IF"
+		eval "_EC_RT=\$TUNNEL_${_EC_i}_ROUTE_TABLE"
+		if is_tunnel_up "$_EC_IFACE"; then
+			if [ -n "$_EC_RT" ]; then
+				ip route exec table "$_EC_RT" curl "$@" && return 0
+			fi
+			curl --interface "$_EC_WG_IF" "$@" && return 0
+		fi
+		_EC_i=$(( _EC_i + 1 ))
+	done
+	return 1
+}
+
+check_for_update() {
+	_CFU_COMMIT_URL='https://api.github.com/repos/92jackson/wg_failover.sh/commits/main'
+	_CFU_RAW_URL='https://raw.githubusercontent.com/92jackson/wg_failover.sh/refs/heads/main/wg_failover.sh'
+	UPDATE_CHECK_STATUS='error'
+	UPDATE_REMOTE_VER=''
+	UPDATE_CHECK_MESSAGE='check failed'
+
+	if command -v jsonfilter >/dev/null 2>&1; then
+		UPDATE_REMOTE_VER=$(
+			external_curl -fsL --max-time 5 \
+				-H "User-Agent: wg_failover.sh" \
+				"$_CFU_COMMIT_URL" 2>/dev/null \
+			| jsonfilter -e '@.commit.message' 2>/dev/null \
+			| sed -n '1p' \
+			| grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' \
+			| head -n1
+		)
+	fi
+
+	if [ -z "$UPDATE_REMOTE_VER" ]; then
+		UPDATE_REMOTE_VER=$(
+			external_curl -fsL --max-time 5 "$_CFU_RAW_URL" 2>/dev/null \
+			| sed -n "3s/^VER='\([0-9][0-9.]*\)'.*/\1/p"
+		)
+	fi
+
+	[ -z "$UPDATE_REMOTE_VER" ] && return 1
+
+	if [ "$UPDATE_REMOTE_VER" = "$VER" ]; then
+		UPDATE_CHECK_STATUS='current'
+		UPDATE_CHECK_MESSAGE="up to date (v${VER})"
+	else
+		UPDATE_CHECK_STATUS='update'
+		UPDATE_CHECK_MESSAGE="update available: v${UPDATE_REMOTE_VER} (current: v${VER})"
+	fi
+	return 0
+}
+
+cmd_check_update() {
+	check_for_update >/dev/null 2>&1
+	case "$UPDATE_CHECK_STATUS" in
+		current)
+			echo "Update check: ${UPDATE_CHECK_MESSAGE}"
+			;;
+		update)
+			echo "Update check: ${UPDATE_CHECK_MESSAGE}"
+			;;
+		*)
+			echo "Update check: failed"
+			return 1
+			;;
+	esac
+}
+
 
 # --- Validation ---------------------------------------------------------------
 
@@ -711,6 +820,8 @@ validate_config() {
 		fi
 	}
 
+	resolve_privacy_route_config
+
 	case "${GLINET_SWITCH_METHOD:-}" in
 		auto|api|uci) ;;
 		*)
@@ -727,7 +838,7 @@ validate_config() {
 			;;
 	esac
 
-	validate_bool_01 "WAN_CHECK_VIA_TUNNEL" "${WAN_CHECK_VIA_TUNNEL:-0}" || exit 1
+	validate_bool_01 "PRIVACY_ROUTE_VIA_TUNNEL" "${PRIVACY_ROUTE_VIA_TUNNEL:-0}" || exit 1
 	validate_bool_01 "PRE_FAILOVER_PING" "${PRE_FAILOVER_PING:-0}" || exit 1
 	validate_bool_01 "PING_VERIFY" "${PING_VERIFY:-0}" || exit 1
 	validate_non_negative_int "WAN_STABILITY_THRESHOLD" "${WAN_STABILITY_THRESHOLD:-0}" || exit 1
@@ -822,11 +933,6 @@ $_VC_ROUTE_TABLE"
 		exit 1
 	fi
 
-	if [ "${WAN_CHECK_VIA_TUNNEL:-0}" = "1" ] && [ "$TUNNEL_COUNT" -le 1 ]; then
-		echo "Error: WAN_CHECK_VIA_TUNNEL=1 requires more than one tunnel"
-		echo "       With only one tunnel, the script cannot distinguish WAN outage from tunnel failure."
-		exit 1
-	fi
 }
 
 # --- Target matching ----------------------------------------------------------
@@ -1680,7 +1786,7 @@ To: ${_TO}" ;;
 		esac
 		[ -n "$INTERACTIVE" ] && _MSG="[[TEST]] ${_MSG}"
 	fi
-	curl -s -o /dev/null --max-time 10 -d "$_MSG" "$WEBHOOK_URL" &
+	external_curl -s -o /dev/null --max-time 10 -d "$_MSG" "$WEBHOOK_URL" &
 }
 
 _webhook_json() {
@@ -1703,7 +1809,7 @@ _webhook_json() {
 				_BODY="{\"tunnel\":\"${_TUN}\",\"from\":\"${_FROM}\",\"to\":\"${_TO}\",\"status\":\"${_ST}\"}" ;;
 		esac
 	fi
-	curl -s -o /dev/null --max-time 10 \
+	external_curl -s -o /dev/null --max-time 10 \
 		-H "Content-Type: application/json" \
 		-d "$_BODY" "$WEBHOOK_URL" &
 }
@@ -1728,7 +1834,7 @@ _webhook_get() {
 				_QUERY="tunnel=$(urlencode "$_TUN")&from=$(urlencode "$_FROM")&to=$(urlencode "$_TO")&status=$(urlencode "$_ST")" ;;
 		esac
 	fi
-	curl -s -o /dev/null --max-time 10 "${WEBHOOK_URL}?${_QUERY}" &
+	external_curl -s -o /dev/null --max-time 10 "${WEBHOOK_URL}?${_QUERY}" &
 }
 
 _webhook_ntfy() {
@@ -1760,7 +1866,7 @@ _webhook_ntfy() {
 		_PRI="$_META_PRI_NAME" _TAGS="$_META_TAGS"
 		[ -n "$INTERACTIVE" ] && _MSG="[🛠️] ${_MSG}"
 	fi
-	curl -s -o /dev/null --max-time 10 \
+	external_curl -s -o /dev/null --max-time 10 \
 		-H "Title: ${_TITLE}" \
 		-H "Priority: ${_PRI}" \
 		-H "Tags: ${_TAGS}" \
@@ -1787,7 +1893,7 @@ _webhook_gotify() {
 		[ -n "$INTERACTIVE" ] && _MSG="[[TEST]] ${_MSG}"
 	fi
 	_BODY="{\"title\":\"${_TITLE}\",\"message\":\"${_MSG}\",\"priority\":${_PRI}}"
-	curl -s -o /dev/null --max-time 10 \
+	external_curl -s -o /dev/null --max-time 10 \
 		-H "Content-Type: application/json" \
 		-d "$_BODY" "$WEBHOOK_URL" &
 }
@@ -1968,18 +2074,19 @@ wan_is_reachable() {
 	[ -z "$WAN_PING_TARGETS" ] && \
 		log_verbose "WAN pre-flight: ping check disabled (WAN_PING_TARGETS empty)" && return 0
 
-	if [ "${WAN_CHECK_VIA_TUNNEL:-0}" = "1" ]; then
+	if privacy_route_enabled; then
 		if [ "${TUNNEL_COUNT:-0}" -le 1 ]; then
-			log_error "WAN pre-flight: invalid config -- WAN_CHECK_VIA_TUNNEL=1 requires more than one tunnel"
-			return 1
+			log_warn "WAN pre-flight: bypassing ping check (PRIVACY_ROUTE_VIA_TUNNEL=1 with only one tunnel)"
+			log_warn "WAN pre-flight: WAN stability will rely on WAN interface uptime only"
+			return 0
 		fi
-		# Ping through each enabled tunnel until one target responds
+		# Ping through each usable tunnel until one target responds
 		_WIR_i=1
 		while [ "$_WIR_i" -le "$TUNNEL_COUNT" ]; do
+			eval "_WIR_IFACE=\$TUNNEL_${_WIR_i}_IFACE"
 			eval "_WIR_WG_IF=\$TUNNEL_${_WIR_i}_WG_IF"
 			eval "_WIR_RT=\$TUNNEL_${_WIR_i}_ROUTE_TABLE"
-			eval "_WIR_ENABLED=\$TUNNEL_${_WIR_i}_FAILOVER_ENABLED"
-			if [ "$_WIR_ENABLED" = "1" ]; then
+			if is_tunnel_up "$_WIR_IFACE"; then
 				for _WIR_TARGET in $WAN_PING_TARGETS; do
 					if [ -n "$_WIR_RT" ]; then
 						ip route exec table "$_WIR_RT" \
@@ -1994,7 +2101,7 @@ wan_is_reachable() {
 			fi
 			_WIR_i=$(( _WIR_i + 1 ))
 		done
-		log_verbose "WAN pre-flight: no tunnel could reach any WAN_PING_TARGETS"
+		log_verbose "WAN pre-flight: no usable tunnel could reach any WAN_PING_TARGETS"
 		return 1
 	else
 		# Ping directly via WAN interface
@@ -2778,12 +2885,13 @@ _build_benchmark_lines() {
 	_BBL_i=1
 	while [ "$_BBL_i" -le "$TUNNEL_COUNT" ]; do
 		eval "_BBL_IFACE=\$TUNNEL_${_BBL_i}_IFACE"
+		eval "_BBL_LABEL=\$TUNNEL_${_BBL_i}_LABEL"
 		_BBL_ACTIVE_ID=$(get_active_peer "$_BBL_IFACE")
 		_BBL_ACTIVE_NAME=$(get_peer_name "$_BBL_ACTIVE_ID")
 		_BBL_REPORT=$(build_benchmark_report_for_iface "$_BBL_IFACE" "$_BBL_NOW")
 		parse_benchmark_tunnel_summary "$(printf '%s\n' "$_BBL_REPORT" | sed -n '1p')" "$_BBL_NOW"
 		_BBL_AVG30_INT=$(awk -v x="${B_T_AVG30:-0}" 'BEGIN { printf "%.0f", x+0 }')
-		printf '%s: ~%s Mbps\n' "$_BBL_ACTIVE_NAME" "$_BBL_AVG30_INT"
+		printf '%s: ~%s Mbps\n' "$_BBL_LABEL" "$_BBL_AVG30_INT"
 		if [ "$B_T_LAST_TS" = "none" ]; then
 			printf '%s\n' '      No benchmark history'
 		fi
@@ -3290,6 +3398,13 @@ cmd_status() {
 		echo "============================================"
 		echo "  wg_failover.sh v${VER} -- Status"
 		echo "  $NOW_HUMAN"
+		check_for_update >/dev/null 2>&1
+		case "$UPDATE_CHECK_STATUS" in
+			current) _UPDATE_LINE_COLOUR="${_C_GREEN}" ;;
+			update)  _UPDATE_LINE_COLOUR="${_C_RED}" ;;
+			*)       _UPDATE_LINE_COLOUR="${_C_AMBER}" ;;
+		esac
+		printf "  Update: %b%s%b\n" "$_UPDATE_LINE_COLOUR" "$UPDATE_CHECK_MESSAGE" "${_C_RESET}"
 		echo "============================================"
 
 		# ── TUNNELS ───────────────────────────────────────────────────────────
@@ -3519,7 +3634,7 @@ cmd_status() {
 				_WAN_REACH_STR="$(badge_err "UNREACHABLE")"
 			fi
 			_WAN_CHECK_MODE="direct"
-			[ "${WAN_CHECK_VIA_TUNNEL:-0}" = "1" ] && _WAN_CHECK_MODE="via tunnel"
+			privacy_route_enabled && _WAN_CHECK_MODE="via tunnel"
 			_WAN_ROW="${_WAN_IFACE_DISPLAY} — ${_WAN_REACH_STR}  ${_C_DIM}(targets: ${WAN_PING_TARGETS:-none}, check: ${_WAN_CHECK_MODE})${_C_RESET}"
 			if [ -n "$_WAN_INFO_UPTIME_SECS" ] && [ "$_WAN_INFO_UPTIME_SECS" -gt 0 ] 2>/dev/null; then
 				_WAN_ROW="${_WAN_ROW}  ${_C_DIM}uptime: $(format_duration "$_WAN_INFO_UPTIME_SECS")${_C_RESET}"
@@ -3618,7 +3733,7 @@ cmd_status() {
 		printf '    "stable": %s,\n'             "$WAN_STABLE_JSON"
 		printf '    "stable_for_s": %s,\n'       "$_STATUS_WAN_STABLE_FOR"
 		printf '    "stability_threshold_s": %s,\n' "${WAN_STABILITY_THRESHOLD:-0}"
-		printf '    "check_via_tunnel": %s,\n'   "$([ "${WAN_CHECK_VIA_TUNNEL:-0}" = "1" ] && echo true || echo false)"
+		printf '    "check_via_tunnel": %s,\n'   "$([ "${PRIVACY_ROUTE_VIA_TUNNEL:-0}" = "1" ] && echo true || echo false)"
 		printf '    "last_known_state": "%s"\n'  "$WAN_LAST_STATE"
 		printf '  },\n'
 
@@ -3656,7 +3771,7 @@ cmd_status() {
 		printf '    "ping_timeout_s": %s,\n'              "$PING_TIMEOUT"
 		printf '    "post_switch_handshake_timeout_s": %s,\n' "$POST_SWITCH_HANDSHAKE_TIMEOUT"
 		printf '    "wan_stability_threshold_s": %s,\n'   "${WAN_STABILITY_THRESHOLD:-0}"
-		printf '    "wan_check_via_tunnel": %s,\n'        "$([ "${WAN_CHECK_VIA_TUNNEL:-0}" = "1" ] && echo true || echo false)"
+		printf '    "privacy_route_via_tunnel": %s,\n'    "$([ "${PRIVACY_ROUTE_VIA_TUNNEL:-0}" = "1" ] && echo true || echo false)"
 		printf '    "webhook_repeat_interval_s": %s,\n'   "${WEBHOOK_REPEAT_INTERVAL:-300}"
 		printf '    "history_max_lines": %s,\n'           "${HISTORY_MAX_LINES:-0}"
 		printf '    "log_level": %s\n'                    "$LOG_LEVEL"
@@ -4155,6 +4270,11 @@ parse_args "$@"
 mkdir -p "$STATE_DIR"
 check_dependencies
 validate_config
+
+if [ "$FLAG_CHECK_UPDATE" = "1" ] && [ -z "$SUBCOMMAND" ]; then
+	cmd_check_update
+	exit $?
+fi
 
 # Pure subcommands — no lock needed
 case "$SUBCOMMAND" in
