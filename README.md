@@ -122,11 +122,11 @@ vi /usr/bin/wg_failover.sh
 # Tunnel 1
 TUNNEL_COUNT=1
 
+TUNNEL_1_LABEL='Primary'             # Friendly name (free text)
 TUNNEL_1_IFACE='wgclient1'           # From Step 2A
 TUNNEL_1_WG_IF='wgclient1'           # From Step 2A
-TUNNEL_1_LABEL='Primary'             # Friendly name (free text)
 TUNNEL_1_KEYWORD='SetA'              # From Step 2B
-TUNNEL_1_ROUTE_TABLE='1001'          # From Step 2C
+TUNNEL_1_ROUTE_TABLE='1001'          # From Step 2C (optional — '' = interface-bound fallback)
 TUNNEL_1_FAILOVER_ENABLED=1          # Monitor for failovers (0=disabled)
 ```
 
@@ -268,6 +268,7 @@ All flags are composable and may appear in any order. Tunnel targeting accepts e
 | `--fail-wan`               | Simulate a WAN outage — failover is suppressed on all tunnels this run.                                     |
 | `--force-rotate [label]`   | Immediately rotate to the next peer without simulating a failure. Omit label to rotate all.                 |
 | `--benchmark [label]`      | Run a throughput benchmark on the current active peer. Omit label to benchmark all enabled tunnels.         |
+| `--benchmark --all-peers`  | Benchmark all peers on one or more tunnels, cycling through each and returning to the original.             |
 | `--exercise [label]`       | Run a full forward/return switch test. Reverts automatically. **Suppresses webhooks and log writes.**       |
 | `--revert`                 | After a successful switch, switch back to the original peer.                                                |
 | `--ignore-cooldown`        | Skip cooldown checks when selecting the next peer.                                                          |
@@ -304,6 +305,9 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 /usr/bin/wg_failover.sh --benchmark "Primary"
 /usr/bin/wg_failover.sh --benchmark --iface wgclient1
 
+# Benchmark all peers on all tunnels
+/usr/bin/wg_failover.sh --benchmark --all-peers
+
 # Print benchmark summaries
 /usr/bin/wg_failover.sh benchmarks
 /usr/bin/wg_failover.sh benchmarks --json
@@ -333,14 +337,15 @@ The `<label>` argument must match `TUNNEL_X_LABEL` exactly, including capitalisa
 | Variable                    | Description                                                                                              |
 | --------------------------- | -------------------------------------------------------------------------------------------------------- |
 | `TUNNEL_COUNT`              | Total number of tunnels defined below                                                                    |
+| `TUNNEL_X_LABEL`            | Friendly name used in logs, webhooks, and flag targeting                                                 |
 | `TUNNEL_X_IFACE`            | OpenWrt network interface name (e.g. `wgclient1`)                                                        |
 | `TUNNEL_X_WG_IF`            | WireGuard kernel interface name (usually same as `TUNNEL_X_IFACE`)                                       |
-| `TUNNEL_X_LABEL`            | Friendly name used in logs, webhooks, and flag targeting                                                 |
 | `TUNNEL_X_KEYWORD`          | Substring to match server names · blank = all unclaimed servers                                          |
 | `TUNNEL_X_ROUTE_TABLE`      | Routing table number for ping verification · blank = interface-bound fallback                            |
 | `TUNNEL_X_FAILOVER_ENABLED` | `1` = monitor for failover · `0` = skip this tunnel for failover                                         |
 | `TUNNEL_X_ROTATE`           | CSV rotation schedule. e.g. '21600' (secs), '03:00' (daily), '21600,03:00' (either) · `''` = no rotation |
 | `TUNNEL_X_BENCHMARK_URL`    | Optional benchmark test-file URL override for this tunnel · blank = use `BENCHMARK_URL`                  |
+| `TUNNEL_X_PEER_ORDER`       | Peer selection order: `sequential` (default) \| `random`                                                 |
 
 ### WAN Safety Guard
 
@@ -405,13 +410,15 @@ Only use this setting if you are running a privacy-conscious setup.
 
 ### Benchmarking
 
-| Variable                      | Description                                                                             | Default                                   |
-| ----------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `BENCHMARK_URL`               | Default public test-file URL used for throughput benchmarking                           | `https://ash-speed.hetzner.com/100MB.bin` |
-| `BENCHMARK_TIMEOUT`           | Max seconds per benchmark request                                                       | `30`                                      |
-| `BENCHMARK_HISTORY_MAX_LINES` | Max benchmark history entries per tunnel                                                | `200`                                     |
-| `BENCHMARK_INTERVAL`          | CSV schedule for periodic current-peer benchmarks. e.g. `21600`, `03:00`, `21600,03:00` | `''`                                      |
-| `BENCHMARK_INTERVAL_WEBHOOK`  | `0` = disabled, `1` = send webhook every interval, `-1` = send only last interval       | `0`                                       |
+| Variable                        | Description                                                                                                                               | Default                                   |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `BENCHMARK_URL`                 | Default public test-file URL used for throughput benchmarking                                                                             | `https://ash-speed.hetzner.com/100MB.bin` |
+| `BENCHMARK_TIMEOUT`             | Max seconds per benchmark request                                                                                                         | `30`                                      |
+| `BENCHMARK_HISTORY_MAX_LINES`   | Max benchmark history entries to retain per peer · `''` = unlimited                                                                      | `200`                                     |
+| `BENCHMARK_INTERVAL`            | CSV schedule for periodic current-peer benchmarks. e.g. `21600`, `03:00`, `21600,03:00`                                                   | `''`                                      |
+| `BENCHMARK_INTERVAL_WEBHOOK`    | `0` = disabled, `1` = send webhook every interval, `-1` = send only on last interval                                                     | `0`                                       |
+| `BENCHMARK_INTERVAL_ALL_PEERS`  | `1` = sweep all peers on each interval benchmark run (cycles through all peers, returns to original) · `0` = current peer only           | `0`                                       |
+| `BENCHMARK_SWEEP_TUNNEL`        | Tunnel index (e.g. `1`, `2`) to use as the active tunnel during all-peer sweeps · `''` = disabled                                        | `''`                                      |
 
 ### Webhook Notifications
 
@@ -420,7 +427,7 @@ Only use this setting if you are running a privacy-conscious setup.
 | `WEBHOOK_URL`             | Notification endpoint · `''` = disable                                                            | `''`    |
 | `WEBHOOK_PROCESSOR`       | GET = `''` · POST: `'text'` (plain text), `'json'`, `'ntfy'`, `'gotify'`                          | `''`    |
 | `WEBHOOK_REPEAT_INTERVAL` | Minimum seconds before the same event fires again on the same tunnel                              | `300`   |
-| `STATUS_WEBHOOK_INTERVAL` | CSV schedule for periodic status webhooks. e.g. '21600' (sec), '06:00,18:00', '21600,06:00,18:00' | ''      |
+| `STATUS_WEBHOOK_INTERVAL` | CSV schedule for periodic status webhooks. e.g. '21600' (sec), '06:00,18:00', '21600,06:00,18:00' | `''`    |
 
 ---
 
