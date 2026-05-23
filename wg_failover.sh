@@ -1,6 +1,6 @@
 #!/bin/sh
 # =================================================================================
-VER='2.1.1'
+VER='2.2.0'
 # WireGuard VPN Tunnel Failover and Auto-Rotate for OpenWrt
 #
 # GitHub : https://github.com/92jackson/wg_failover.sh
@@ -59,6 +59,7 @@ VER='2.1.1'
 #   --fail <label>            — simulate failure on tunnel
 #   --fail-wan                — simulate a WAN outage
 #   --benchmark [label]       — benchmark current peer on one or more tunnels
+#   --benchmark --all-peers   — benchmark all peers on one or more tunnels
 #   --revert                  — after a successful switch, revert to the original peer
 #   --ignore-cooldown         — skip cooldown checks when selecting the next peer
 #   --switch-method <method>  — override GLINET_SWITCH_METHOD for this run
@@ -105,33 +106,35 @@ VER='2.1.1'
 # At least one tunnel must be defined for the script to function.
 #
 # Use these commands to discover values before editing:
-#   (a) List WG interfaces:   uci show network | grep '\.config='
-#   (b) List servers (peers): uci show wireguard | grep '\.name='
-#   (c) Routing tables:       uci show network | grep ip4table
+#   (a) List interfaces:            uci show network | grep '\.config='
+#   (b) List peers (servers):       uci show wireguard | grep '\.name='
+#   (c) Routing tables (optional):  uci show network | grep ip4table
 # For more detail on setting up tunnels, see: https://github.com/92jackson/wg_failover.sh#step-2--run-discovery-commands
 # =============================================================================
 
 TUNNEL_COUNT=1                     # Number of tunnels on router AND defined below
 
 # TUNNEL 1 EXAMPLE
-TUNNEL_1_IFACE='wgclient1'         # (1) OpenWrt interface name
-TUNNEL_1_WG_IF='wgclient1'         # WireGuard kernel interface (usually same as _IFACE)
 TUNNEL_1_LABEL='Primary'           # Friendly name for logs/webhooks (free text)
-TUNNEL_1_KEYWORD=''                # (2) Substring matching this tunnel's peers. '' = all unallocated peers
-TUNNEL_1_ROUTE_TABLE='1001'        # (3) Routing table
+TUNNEL_1_IFACE='wgclient1'         # (a) OpenWrt interface name
+TUNNEL_1_WG_IF='wgclient1'         # (a) WireGuard kernel interface (usually same as _IFACE)
+TUNNEL_1_KEYWORD=''                # (b) Substring matching this tunnel's peers. '' = all unallocated peers
+TUNNEL_1_ROUTE_TABLE=''            # (c) Routing table
 TUNNEL_1_FAILOVER_ENABLED=1        # 1 = Script monitors tunnel for failover
-TUNNEL_1_ROTATE=''                 # CSV rotation schedule. e.g. '21600' (secs) | '03:00' (daily) | '21600,03:00' (either)
+TUNNEL_1_ROTATE=''                 # CSV rotation schedule. e.g. '21600' (secs) | '03:00' (daily) | '21600,03:00,21:00' (either)
 TUNNEL_1_BENCHMARK_URL=''          # Optional benchmark URL override. '' = use global BENCHMARK_URL
+TUNNEL_1_PEER_ORDER='sequential'   # Peer selection order: 'sequential' (default) | 'random'
 
 # TUNNEL 2 EXAMPLE
+#TUNNEL_2_LABEL='Streaming'
 #TUNNEL_2_IFACE='wgclient2'
 #TUNNEL_2_WG_IF='wgclient2'
-#TUNNEL_2_LABEL='Streaming'
-#TUNNEL_2_KEYWORD='CCwGTV'         # Matches peers with 'CCwGTV' in their name
+#TUNNEL_2_KEYWORD='CCwGTV'         # Example matches peers with 'CCwGTV' in their name
 #TUNNEL_2_ROUTE_TABLE='1002'
 #TUNNEL_2_FAILOVER_ENABLED=1
 #TUNNEL_2_ROTATE='21600,03:00'     # Rotate every 6h and daily at 03:00
 #TUNNEL_2_BENCHMARK_URL='http://ipv4.download.thinkbroadband.com/20MB.zip'
+#TUNNEL_2_PEER_ORDER='random'      # Peer selection order: 'sequential' (default) | 'random'
 
 
 # =============================================================================
@@ -146,7 +149,7 @@ WAN_STABILITY_THRESHOLD=120           # Min WAN uptime (seconds) before acting o
 
 # =============================================================================
 # PRIVACY ROUTING (OPTIONAL)
-# Routes non-local outbound traffic via tunnels where possible.
+# Routes non-local outbound traffic via tunnels.
 # Affects update checks, webhooks, and WAN reachability checks.
 # If no usable tunnel exists, privacy-routed requests fail instead of falling back.
 # If enabled with only 1 tunnel defined, WAN ping checks are bypassed because the
@@ -224,7 +227,10 @@ STATE_DIR='/tmp/wg_failover'        # Runtime state
 WEBHOOK_URL=''                      # Set endpoint to enable notifications. '' to disable
 WEBHOOK_PROCESSOR=''                # '' = GET request, POST request: 'text' | 'json' | 'ntfy' | 'gotify'
 WEBHOOK_REPEAT_INTERVAL=300         # Seconds before repeating the same event
-STATUS_WEBHOOK_INTERVAL=''          # CSV schedule for periodic status webhooks. e.g. '21600' | '06:00,18:00'
+STATUS_WEBHOOK_INTERVAL=''          # CSV schedule:
+# CSV schedule format: comma-separated intervals in seconds (e.g. '21600') or HH:MM daily times
+# (e.g. '03:00'), or a mix of both (e.g. '21600,03:00,15:00'). Seconds trigger repeatedly
+# at that interval; HH:MM times trigger once daily within one cron tick of the scheduled time.
 
 
 # =============================================================================
@@ -235,8 +241,10 @@ STATUS_WEBHOOK_INTERVAL=''          # CSV schedule for periodic status webhooks.
 
 BENCHMARK_URL='https://ash-speed.hetzner.com/100MB.bin' # Default test file URL
 BENCHMARK_TIMEOUT=30                                    # Max seconds per benchmark request
-BENCHMARK_HISTORY_MAX_LINES=200                         # Per-tunnel benchmark history retention
-BENCHMARK_INTERVAL=''                                   # CSV schedule. e.g. '21600' | '03:00' | '21600,03:00'
+BENCHMARK_HISTORY_MAX_LINES=200                         # Max benchmark history entries to retain per peer. '' = unlimited
+BENCHMARK_INTERVAL=''                                   # CSV schedule (see note on STATUS_WEBHOOK_INTERVAL explaining CSV format)
+BENCHMARK_INTERVAL_ALL_PEERS=0                          # 1 = sweep all peers on interval benchmark run (cycles through all, returns to original)
+BENCHMARK_SWEEP_TUNNEL=''                               # Tunnel index (1, 2, ...) to use for cross-tunnel all-peer sweeps. '' = disabled
 BENCHMARK_INTERVAL_WEBHOOK=0                            # 0=disabled, 1=send after every run, -1=send only on last interval CSV entry
 
 # =================================================================================
@@ -271,8 +279,9 @@ FLAG_FORCE_ROTATE_IFACE=''
 FLAG_BENCHMARK=0
 FLAG_BENCHMARK_LABEL=''
 FLAG_BENCHMARK_IFACE=''
+FLAG_BENCHMARK_ALL_PEERS=0
 FLAG_SWITCH_METHOD=''
-INTERACTIVE=''
+INTERACTIVE=0
 TEST_PASS=0
 TEST_FAIL=0
 FLAG_DEBUG=0
@@ -384,6 +393,11 @@ parse_args() {
 					FLAG_BENCHMARK_LABEL="$1"
 					shift
 				fi
+				# Optional --all-peers qualifier (may appear after label/iface or alone)
+				if [ "$1" = "--all-peers" ]; then
+					FLAG_BENCHMARK_ALL_PEERS=1
+					shift
+				fi
 				;;
 			--revert)
 				FLAG_REVERT=1
@@ -462,7 +476,7 @@ parse_args() {
 				echo "Usage: $0 [status [--json|--webhook]|benchmarks [--json|--webhook]|reset [--keep-history]] [--dry-run] [--version] [--debug] [--check-update]"
 				echo "          [--fail [--iface] <target>] [--fail-wan]"
 				echo "          [--exercise [--iface] [target]] [--force-rotate [--iface] [target]]"
-				echo "          [--benchmark [--iface] [target]]"
+				echo "          [--benchmark [--iface] [target] [--all-peers]]"
 				exit 1
 				;;
 		esac
@@ -572,6 +586,8 @@ log_info()    { log 2 "[INFO]   $1"; }
 log_change()  { log 1 "[CHANGE] $1"; }
 log_error()   { log 1 "[ERROR]  $1"; }
 log_warn()    { log 1 "[WARN]   $1"; }
+log_success() { log 1 "[OK]     $1"; }
+log_fail()    { log 1 "[FAIL]   $1"; }
 log_verbose() { log 3 "[DEBUG]  $1"; }
 log_dryrun()  {
 	TIME_ONLY=$(date '+%H:%M:%S')
@@ -586,6 +602,7 @@ test_step() {
 
 	case "$_TS_STATUS" in
 		PASS)    _TS_COLOUR="$_C_GREEN"    ;;
+		OK)      _TS_COLOUR="$_C_GREEN"    ;;
 		INFO)    _TS_COLOUR="$_C_BLUE"     ;;
 		WARN)    _TS_COLOUR="$_C_AMBER"    ;;
 		DRY-RUN) _TS_COLOUR="$_C_LAVENDER" ;;
@@ -877,6 +894,15 @@ validate_config() {
 	validate_http_url "GLINET_ROUTER" "$GLINET_ROUTER" || exit 1
 	validate_http_url "BENCHMARK_URL" "$BENCHMARK_URL" || exit 1
 
+	if [ -n "$BENCHMARK_SWEEP_TUNNEL" ]; then
+		if ! printf '%s' "$BENCHMARK_SWEEP_TUNNEL" | grep -Eq '^[0-9]+$' || \
+		   [ "$BENCHMARK_SWEEP_TUNNEL" -lt 1 ] || \
+		   [ "$BENCHMARK_SWEEP_TUNNEL" -gt "$TUNNEL_COUNT" ]; then
+			echo "Error: BENCHMARK_SWEEP_TUNNEL must be a tunnel index between 1 and ${TUNNEL_COUNT} (got: '${BENCHMARK_SWEEP_TUNNEL}')"
+			exit 1
+		fi
+	fi
+
 	_BLANK_KEYWORD_COUNT=0
 	_SEEN_LABELS=''
 	_SEEN_IFACES=''
@@ -984,6 +1010,50 @@ print_available_tunnels() {
 		printf "    %-30s  (iface: %s)\n" "$_L" "$_IF"
 		j=$((j + 1))
 	done
+}
+
+# Loads standard tunnel variables for index $1 into unprefixed globals.
+# Sets: IFACE WG_IF LABEL KEYWORD ROUTE_TABLE ENABLED
+load_tunnel_vars() {
+	eval "IFACE=\$TUNNEL_${1}_IFACE"
+	eval "WG_IF=\$TUNNEL_${1}_WG_IF"
+	eval "LABEL=\$TUNNEL_${1}_LABEL"
+	eval "KEYWORD=\$TUNNEL_${1}_KEYWORD"
+	eval "ROUTE_TABLE=\$TUNNEL_${1}_ROUTE_TABLE"
+	eval "ENABLED=\$TUNNEL_${1}_FAILOVER_ENABLED"
+}
+
+# Builds POOL and POOL_COUNT for the current tunnel index $1.
+# Requires LABEL and KEYWORD to already be set (via load_tunnel_vars).
+# Manages BLANK_KEYWORD_SEEN guard. Returns 1 if tunnel should be skipped.
+build_tunnel_pool() {
+	if [ -z "$KEYWORD" ]; then
+		if [ "$BLANK_KEYWORD_SEEN" = "1" ]; then
+			log_error "Tunnel '${LABEL}': multiple blank-keyword tunnels -- only one allowed, skipping"
+			return 1
+		fi
+		POOL=$(get_peers_excluding_other_keywords "$1")
+		BLANK_KEYWORD_SEEN=1
+	else
+		POOL=$(get_peers_for_keyword "$KEYWORD")
+	fi
+	set -- $POOL; POOL_COUNT=$#
+}
+
+# Prints a no-match warning if a targeted command matched no enabled tunnels.
+# Args: command  count  label  iface
+# Prints nothing if count > 0 or no target was given.
+warn_no_tunnel_match() {
+	[ "$2" -gt 0 ] && return
+	[ -z "$3" ] && [ -z "$4" ] && return
+	echo ""
+	if [ -n "$4" ]; then
+		echo "Warning: --${1} --iface '${4}' did not match any enabled tunnel."
+	else
+		echo "Warning: --${1} label '${3}' did not match any enabled tunnel."
+	fi
+	echo "Available tunnels:"
+	print_available_tunnels
 }
 
 # Runs state-changing commands, with dry-run support.
@@ -1288,7 +1358,7 @@ send_wan_webhook() {
 		if [ "$_PREV_STATE" = "down" ]; then
 			echo "up" > "$WAN_STATE_FILE"
 			# Recovery event.
-			log_info "WAN restored — internet connectivity is back"
+			log_success "WAN restored — internet connectivity is back"
 			send_webhook_payload "wan" "" "" "wan_up"
 			log_verbose "WAN webhook sent: wan_up"
 		fi
@@ -1616,12 +1686,17 @@ _build_status_lines() {
 	_BSL_WAN_STABLE=$5 _BSL_WAN_STABLE_FOR=$6 _BSL_WAN_STABLE_REM=$7
 
 	printf '%s\n' "$_SSW_TUNNEL_DATA" | while IFS='|' read -r _L _IF _ST _PEER _PING _ROT _TOTAL _AVAIL _F24 _LA _F30; do
-		_BSL_BENCH_SUMMARY=$(build_benchmark_summary_for_iface "$_IF" "$(date +%s)")
-		IFS='|' read -r _BSL_LAST_TS _BSL_LAST_PEER _BSL_LAST_HOST _BSL_LAST_RESULT _BSL_LAST_MBPS _BSL_LAST_AGO \
-			_BSL_COUNT24 _BSL_COUNT7 _BSL_COUNT30 _BSL_OK30 _BSL_FAIL30 _BSL_AVG24 _BSL_AVG7 _BSL_AVG30 _BSL_BEST30 _BSL_WORST30 <<EOF
-$_BSL_BENCH_SUMMARY
-EOF
-		_BSL_AVG30_INT=$(awk -v x="${_BSL_AVG30:-0}" 'BEGIN { printf "%.0f", x+0 }')
+		_BSL_IDX=1
+		while [ "$_BSL_IDX" -le "$TUNNEL_COUNT" ]; do
+			eval "_BSL_CHECK=\$TUNNEL_${_BSL_IDX}_IFACE"
+			[ "$_BSL_CHECK" = "$_IF" ] && break
+			_BSL_IDX=$((_BSL_IDX + 1))
+		done
+		_BSL_NOW_EPOCH=$(date +%s)
+		parse_benchmark_tunnel_summary \
+			"$(get_benchmark_report_for_tunnel_index "$_BSL_IDX" "$_BSL_NOW_EPOCH" | sed -n '1p')" \
+			"$_BSL_NOW_EPOCH"
+		_BSL_AVG30_INT=$(awk -v x="${B_T_AVG30:-0}" 'BEGIN { printf "%.0f", x+0 }')
 
 		if [ "$_BSL_FMT" = "rich" ]; then
 			_IND=$(_state_emoji "$_ST" "$_F24")
@@ -1951,6 +2026,110 @@ get_peers_excluding_other_keywords() {
 	done
 }
 
+# Returns a deduplicated space-separated list of all peers across all enabled tunnels.
+# Uses existing per-tunnel pool functions, so keyword scoping is respected.
+# Sets _GATP_BLANK_SEEN internally to correctly handle blank-keyword tunnels.
+get_all_tunnel_peers() {
+	_GATP_ALL=''
+	_GATP_BLANK_SEEN=0
+	_GATP_i=1
+	while [ "$_GATP_i" -le "$TUNNEL_COUNT" ]; do
+		eval "_GATP_ENABLED=\$TUNNEL_${_GATP_i}_FAILOVER_ENABLED"
+		eval "_GATP_KEYWORD=\$TUNNEL_${_GATP_i}_KEYWORD"
+
+		if [ "$_GATP_ENABLED" != "1" ]; then
+			_GATP_i=$((_GATP_i + 1)); continue
+		fi
+
+		if [ -z "$_GATP_KEYWORD" ]; then
+			if [ "$_GATP_BLANK_SEEN" = "1" ]; then
+				_GATP_i=$((_GATP_i + 1)); continue
+			fi
+			_GATP_PEERS=$(get_peers_excluding_other_keywords "$_GATP_i")
+			_GATP_BLANK_SEEN=1
+		else
+			_GATP_PEERS=$(get_peers_for_keyword "$_GATP_KEYWORD")
+		fi
+
+		for _GATP_PEER in $_GATP_PEERS; do
+			case " $_GATP_ALL " in
+				*" $_GATP_PEER "*) ;;  # already in list
+				*) _GATP_ALL="$_GATP_ALL $_GATP_PEER" ;;
+			esac
+		done
+
+		_GATP_i=$((_GATP_i + 1))
+	done
+	printf '%s' "$_GATP_ALL"
+}
+
+# Returns space-separated peer list for tunnel index $1, respecting keyword scoping.
+get_peers_for_tunnel_index() {
+	eval "_GPTI_KEYWORD=\$TUNNEL_${1}_KEYWORD"
+	if [ -z "$_GPTI_KEYWORD" ]; then
+		get_peers_excluding_other_keywords "$1"
+	else
+		get_peers_for_keyword "$_GPTI_KEYWORD"
+	fi
+}
+
+# Returns the tunnel index that owns peer $1, or '' if not found.
+get_tunnel_index_for_peer() {
+	_GTIP_PEER=$1
+	_GTIP_i=1
+	_GTIP_BLANK_SEEN=0
+	while [ "$_GTIP_i" -le "$TUNNEL_COUNT" ]; do
+		eval "_GTIP_ENABLED=\$TUNNEL_${_GTIP_i}_FAILOVER_ENABLED"
+		eval "_GTIP_KEYWORD=\$TUNNEL_${_GTIP_i}_KEYWORD"
+
+		if [ "$_GTIP_ENABLED" != "1" ]; then
+			_GTIP_i=$((_GTIP_i + 1)); continue
+		fi
+
+		if [ -z "$_GTIP_KEYWORD" ]; then
+			[ "$_GTIP_BLANK_SEEN" = "1" ] && { _GTIP_i=$((_GTIP_i + 1)); continue; }
+			_GTIP_PEERS=$(get_peers_excluding_other_keywords "$_GTIP_i")
+			_GTIP_BLANK_SEEN=1
+		else
+			_GTIP_PEERS=$(get_peers_for_keyword "$_GTIP_KEYWORD")
+		fi
+
+		for _GTIP_P in $_GTIP_PEERS; do
+			if [ "$_GTIP_P" = "$_GTIP_PEER" ]; then
+				echo "$_GTIP_i"
+				return 0
+			fi
+		done
+
+		_GTIP_i=$((_GTIP_i + 1))
+	done
+	echo ''
+}
+
+# Resolves the tunnel to use for a cross-tunnel benchmark sweep.
+# Reads BENCHMARK_SWEEP_TUNNEL (label match) and falls back to first enabled tunnel.
+# Sets: SWEEP_IFACE SWEEP_WG_IF SWEEP_LABEL SWEEP_RT
+resolve_sweep_tunnel() {
+	SWEEP_IFACE=''; SWEEP_WG_IF=''; SWEEP_LABEL=''; SWEEP_RT=''; SWEEP_IDX=''
+
+	if [ -z "$BENCHMARK_SWEEP_TUNNEL" ]; then
+		return 1
+	fi
+
+	eval "_RST_ENABLED=\$TUNNEL_${BENCHMARK_SWEEP_TUNNEL}_FAILOVER_ENABLED"
+	if [ "$_RST_ENABLED" != "1" ]; then
+		log_error "BENCHMARK_SWEEP_TUNNEL ${BENCHMARK_SWEEP_TUNNEL} is not enabled"
+		return 1
+	fi
+
+	eval "SWEEP_IFACE=\$TUNNEL_${BENCHMARK_SWEEP_TUNNEL}_IFACE"
+	eval "SWEEP_WG_IF=\$TUNNEL_${BENCHMARK_SWEEP_TUNNEL}_WG_IF"
+	eval "SWEEP_LABEL=\$TUNNEL_${BENCHMARK_SWEEP_TUNNEL}_LABEL"
+	eval "SWEEP_RT=\$TUNNEL_${BENCHMARK_SWEEP_TUNNEL}_ROUTE_TABLE"
+	SWEEP_IDX="$BENCHMARK_SWEEP_TUNNEL"
+	return 0
+}
+
 get_peer_name() {
 	uci get "wireguard.${1}.name" 2>/dev/null || echo "$1"
 }
@@ -1987,9 +2166,9 @@ get_handshake_age() {
 # --- Handshake polling --------------------------------------------------------
 # Polls for a fresh handshake until timeout.
 # Output: seconds taken, or 'timeout'.
-
 wait_for_handshake() {
 	WG_IF=$1
+	_WFH_MIN_EPOCH=${2:-0}   # if set, handshake must post-date this epoch
 	START=$(date +%s)
 	DEADLINE=$((START + POST_SWITCH_HANDSHAKE_TIMEOUT))
 
@@ -1998,7 +2177,17 @@ wait_for_handshake() {
 
 	while [ "$(date +%s)" -lt "$DEADLINE" ]; do
 		AGE=$(get_handshake_age "$WG_IF")
+		_WFH_HS_TIME=$(date -d "@$(( $(date +%s) - AGE ))" '+%H:%M:%S' 2>/dev/null || date -r "$(( $(date +%s) - AGE ))" '+%H:%M:%S' 2>/dev/null || echo 'unknown')
+		log_verbose "Tunnel '${WG_IF}': handshake age ${AGE}s -- last handshake at ${_WFH_HS_TIME} (threshold: ${HANDSHAKE_TIMEOUT}s)"
 		if [ "$AGE" -lt "$HANDSHAKE_TIMEOUT" ]; then
+			if [ "$_WFH_MIN_EPOCH" -gt 0 ] 2>/dev/null; then
+				_WFH_HS_EPOCH=$(( $(date +%s) - AGE ))
+				if [ "$_WFH_HS_EPOCH" -lt "$_WFH_MIN_EPOCH" ]; then
+					log_verbose "Tunnel '${WG_IF}': handshake predates switch (hs_epoch=${_WFH_HS_EPOCH}, switch_ts=${_WFH_MIN_EPOCH}) -- waiting for fresh session"
+					sleep "$HANDSHAKE_POLL_INTERVAL"
+					continue
+				fi
+			fi
 			echo $(( $(date +%s) - START ))
 			return 0
 		fi
@@ -2286,28 +2475,30 @@ schedule_due() {
 	_SD_ELAPSED=$(( _SD_NOW - _SD_LAST ))
 	_SD_DUE=1
 
-	# Iterate CSV entries — use a temp file to avoid subshell exit code loss
-	_SD_TMP=$(mktemp /tmp/wgsd.XXXXXX)
-	printf '%s\n' "$_SD_CSV" | tr ',' '\n' | while IFS= read -r _SD_ENTRY; do
+	# Iterate CSV entries without a pipeline subshell so variables survive
+	_SD_TRIGGERED=""
+	_SD_OLDIFS=$IFS
+	IFS=','
+	for _SD_ENTRY in $_SD_CSV; do
+		IFS=$_SD_OLDIFS
 		_SD_ENTRY=$(printf '%s' "$_SD_ENTRY" | sed 's/^ *//;s/ *$//')
 		[ -z "$_SD_ENTRY" ] && continue
 		case "$_SD_ENTRY" in
 			*:*)
 				if [ "$_SD_CURRENT_TIME" = "$_SD_ENTRY" ] && [ "$_SD_ELAPSED" -gt 3600 ]; then
 					log_verbose "Schedule '${_SD_LABEL}': due (time-of-day ${_SD_ENTRY} matched)"
-					echo "$_SD_ENTRY" > "$_SD_TMP"
+					_SD_TRIGGERED="$_SD_ENTRY"
 				fi
 				;;
 			*)
 				if [ "$_SD_ELAPSED" -ge "$_SD_ENTRY" ] 2>/dev/null; then
 					log_verbose "Schedule '${_SD_LABEL}': due (interval $(format_duration "$_SD_ENTRY") elapsed)"
-					echo "$_SD_ENTRY" > "$_SD_TMP"
+					_SD_TRIGGERED="$_SD_ENTRY"
 				fi
 				;;
 		esac
 	done
-	_SD_TRIGGERED=$(cat "$_SD_TMP" 2>/dev/null)
-	rm -f "$_SD_TMP"
+	IFS=$_SD_OLDIFS
 	[ -n "$_SD_TRIGGERED" ] && SCHEDULE_TRIGGERED_ENTRY="$_SD_TRIGGERED" && return 0
 	SCHEDULE_TRIGGERED_ENTRY=""
 	return 1
@@ -2388,6 +2579,138 @@ schedule_is_last_entry() {
 	[ "$_SIL_ENTRY" = "$_SIL_LAST" ]
 }
 
+# --- Peer order shuffle (random mode) -----------------------------------------
+# Generates and persists a Fisher-Yates shuffled peer list for a tunnel.
+# Invalidated when the pool fingerprint changes or the list is exhausted.
+# State files:
+#   ${IFACE}.peer_order       — space-separated shuffled peer keys
+#   ${IFACE}.peer_order_hash  — fingerprint of the pool that generated it
+#   ${IFACE}.peer_order_idx   — current position in the shuffled list
+
+_peer_order_fingerprint() {
+	# Stable fingerprint of an ordered peer list
+	printf '%s' "$*" | awk '{for(i=1;i<=NF;i++) printf $i" "; print ""}' \
+		| tr ' ' '\n' | sort | tr '\n' ',' | sed 's/,$//'
+}
+
+_shuffle_peers() {
+	# Fisher-Yates shuffle via awk — no external shuf needed
+	printf '%s\n' $@ | awk '
+		BEGIN { srand() }
+		{ lines[NR] = $0 }
+		END {
+			n = NR
+			for (i = n; i > 1; i--) {
+				j = int(rand() * i) + 1
+				tmp = lines[i]; lines[i] = lines[j]; lines[j] = tmp
+			}
+			for (i = 1; i <= n; i++) print lines[i]
+		}
+	' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Returns the next peer from the persisted random shuffle for IFACE.
+# Regenerates the shuffle if the pool changed or the list is exhausted.
+# Falls through to empty string if no eligible peer is found.
+get_next_random_peer() {
+	_GRP_IFACE=$1
+	_GRP_CURRENT=$2
+	shift 2
+	_GRP_POOL="$*"
+
+	_GRP_ORDER_FILE="${STATE_DIR}/${_GRP_IFACE}.peer_order"
+	_GRP_HASH_FILE="${STATE_DIR}/${_GRP_IFACE}.peer_order_hash"
+	_GRP_IDX_FILE="${STATE_DIR}/${_GRP_IFACE}.peer_order_idx"
+
+	_GRP_FINGERPRINT=$(_peer_order_fingerprint $_GRP_POOL)
+	_GRP_SAVED_HASH=$(cat "$_GRP_HASH_FILE" 2>/dev/null || echo '')
+	_GRP_SAVED_ORDER=$(cat "$_GRP_ORDER_FILE" 2>/dev/null || echo '')
+	_GRP_IDX=$(cat "$_GRP_IDX_FILE" 2>/dev/null || echo 0)
+	_GRP_POOL_SIZE=$(echo $_GRP_POOL | wc -w | tr -d ' ')
+	_GRP_SAVED_SIZE=$(echo $_GRP_SAVED_ORDER | wc -w | tr -d ' ')
+
+	# Force regeneration if index is out of bounds
+	if [ "$_GRP_IDX" -ge "$_GRP_SAVED_SIZE" ] 2>/dev/null; then
+		_GRP_REGEN=1
+	else
+		_GRP_REGEN=0
+	fi
+
+	# Regenerate if: pool changed, no saved order, or index forced out of bounds
+	[ "$_GRP_FINGERPRINT" != "$_GRP_SAVED_HASH" ] && _GRP_REGEN=1
+	[ -z "$_GRP_SAVED_ORDER" ] && _GRP_REGEN=1
+	[ "$_GRP_IDX" -ge "$_GRP_SAVED_SIZE" ] 2>/dev/null && _GRP_REGEN=1
+
+ 	if [ "$_GRP_REGEN" = "1" ]; then
+		if [ "$DRY_RUN" = "0" ]; then
+			_GRP_SAVED_ORDER=$(_shuffle_peers $_GRP_POOL)
+			_GRP_FIRST=$(echo $_GRP_SAVED_ORDER | awk '{print $1}')
+			if [ "$_GRP_FIRST" = "$_GRP_CURRENT" ]; then
+				_GRP_SAVED_ORDER=$(echo $_GRP_SAVED_ORDER | awk '{tmp=$1; $1=$2; $2=tmp; print}')
+			fi
+			printf '%s' "$_GRP_SAVED_ORDER" > "$_GRP_ORDER_FILE"
+			printf '%s' "$_GRP_FINGERPRINT" > "$_GRP_HASH_FILE"
+			printf '0' > "$_GRP_IDX_FILE"
+			_GRP_IDX=0
+			_GRP_SAVED_SIZE=$(echo $_GRP_SAVED_ORDER | wc -w | tr -d ' ')
+			log_verbose "Random peer order: new shuffle for '${_GRP_IFACE}': ${_GRP_SAVED_ORDER}"
+		else
+			_GRP_SAVED_ORDER=$_GRP_POOL
+			_GRP_IDX=0
+			_GRP_SAVED_SIZE=$_GRP_POOL_SIZE
+		fi
+
+		# After a reshuffle, rebuild the walk order excluding the current peer
+		# so it doesn't occupy a slot and push the saved index toward exhaustion.
+		# The full order (including current peer) remains persisted on disk for
+		# status display — this trimming is in-memory only for this walk.
+		_GRP_WALK_ORDER=""
+		for _GRP_P in $_GRP_SAVED_ORDER; do
+			[ "$_GRP_P" != "$_GRP_CURRENT" ] && _GRP_WALK_ORDER="$_GRP_WALK_ORDER $_GRP_P"
+		done
+		_GRP_WALK_ORDER=$(printf '%s' "$_GRP_WALK_ORDER" | sed 's/^ //')
+		_GRP_WALK_SIZE=$(echo $_GRP_WALK_ORDER | wc -w | tr -d ' ')
+		_GRP_IDX=0
+	else
+		# No reshuffle — walk the full saved order from current index as normal
+		_GRP_WALK_ORDER="$_GRP_SAVED_ORDER"
+		_GRP_WALK_SIZE=$_GRP_SAVED_SIZE
+	fi
+
+	# Walk the list, skipping cooldown peers.
+	# Current peer is already excluded from _GRP_WALK_ORDER after a reshuffle.
+	# On a carried-over list (no reshuffle), it may still appear and is skipped in-memory.
+	# The saved index tracks position in the full persisted list, so after a reshuffle
+	# it simply counts peers selected (1 = first selected, 2 = second, etc.).
+	while [ "$_GRP_IDX" -lt "$_GRP_WALK_SIZE" ]; do
+		_GRP_PEER=$(echo $_GRP_WALK_ORDER | awk -v n=$((_GRP_IDX + 1)) '{print $n}')
+
+		# Current peer guard for non-reshuffle carried-over lists
+		if [ "$_GRP_PEER" = "$_GRP_CURRENT" ]; then
+			_GRP_IDX=$((_GRP_IDX + 1))
+			continue
+		fi
+
+		# Cooldown: skip in-memory only — temporary condition, don't burn the slot
+		if peer_in_cooldown "$_GRP_IFACE" "$_GRP_PEER"; then
+			_GRP_REM=$(get_cooldown_remaining "$_GRP_IFACE" "$_GRP_PEER")
+			log_verbose "Random peer order: skipping '$(get_peer_name "$_GRP_PEER")' -- cooldown ${_GRP_REM}s remaining"
+			_GRP_IDX=$((_GRP_IDX + 1))
+			continue
+		fi
+
+		# Valid peer found: advance and persist index, then return the peer
+		_GRP_IDX=$((_GRP_IDX + 1))
+		[ "$DRY_RUN" = "0" ] && printf '%s' "$_GRP_IDX" > "$_GRP_IDX_FILE"
+		echo "$_GRP_PEER"
+		return 0
+	done
+
+	# Exhausted — mark so next call triggers a reshuffle
+	[ "$DRY_RUN" = "0" ] && printf '%s' "$_GRP_SAVED_SIZE" > "$_GRP_IDX_FILE"
+	echo ""
+}
+
 # Selects the next peer in sequential pool order for rotation.
 # Skips peers in cooldown (unless --ignore-cooldown is active).
 # Does not skip back to the current peer — if only it is left, returns empty.
@@ -2396,6 +2719,14 @@ get_next_rotation_peer() {
 	CURRENT=$2
 	shift 2
 	POOL="$*"
+
+	eval "_GNR_ORDER=\$TUNNEL_${_TUNNEL_IDX}_PEER_ORDER"
+	_GNR_ORDER="${_GNR_ORDER:-sequential}"
+
+	if [ "$_GNR_ORDER" = "random" ]; then
+		get_next_random_peer "$IFACE" "$CURRENT" $POOL
+		return
+	fi
 
 	# Build ordered list: peers after current first, then peers before, wrapping around
 	AFTER=''
@@ -2463,19 +2794,63 @@ record_benchmark_history() {
 	_BH_Mbps=$6
 	_BH_BYTES=$7
 	_BH_SECONDS=$8
-	_BH_FILE="${STATE_DIR}/${_BH_IFACE}.benchmark_history"
+	_BH_FILE="${STATE_DIR}/benchmark_history"
 	_BH_HOST=$(printf '%s' "$_BH_URL" | sed -n 's#^[a-zA-Z]*://\([^/]*\).*#\1#p')
 	[ -z "$_BH_HOST" ] && _BH_HOST='unknown'
 	_BH_TS=$(date +%s)
 	printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
 		"$_BH_TS" "$_BH_LABEL" "$_BH_PEER" "$_BH_HOST" "$_BH_RESULT" "$_BH_Mbps" "$_BH_BYTES" "$_BH_SECONDS" \
 		>> "$_BH_FILE"
+	# Per-peer line trimming — keeps BENCHMARK_HISTORY_MAX_LINES most recent
+	# entries per peer rather than a global file cap
 	if [ "${BENCHMARK_HISTORY_MAX_LINES:-0}" -gt 0 ]; then
 		_BH_TMP=$(mktemp /tmp/wgbench.XXXXXX)
-		tail -n "$BENCHMARK_HISTORY_MAX_LINES" "$_BH_FILE" > "$_BH_TMP" 2>/dev/null \
+		awk -F'|' -v peer="$_BH_PEER" -v max="$BENCHMARK_HISTORY_MAX_LINES" '
+			{ lines[NR] = $0; peers[NR] = $3 }
+			END {
+				# collect this peer line indices in order
+				n = 0
+				for (i = 1; i <= NR; i++) {
+					if (peers[i] == peer) { pidx[++n] = i }
+				}
+				# mark oldest peer lines for removal if over limit
+				del_before = (n > max) ? pidx[n - max + 1] : 0
+				removed = 0
+				for (i = 1; i <= NR; i++) {
+					if (peers[i] == peer && removed < (n - max)) {
+						removed++; continue
+					}
+					print lines[i]
+				}
+			}
+		' "$_BH_FILE" > "$_BH_TMP" 2>/dev/null \
 			&& mv "$_BH_TMP" "$_BH_FILE" \
 			|| rm -f "$_BH_TMP"
 	fi
+}
+
+# Merges legacy per-iface benchmark_history files into the single shared file.
+# Runs once on startup if any legacy files are detected. Safe to call repeatedly.
+migrate_benchmark_history() {
+	_MBH_DONE="${STATE_DIR}/.benchmark_history_migrated"
+	[ -f "$_MBH_DONE" ] && return
+	_MBH_NEW="${STATE_DIR}/benchmark_history"
+	_MBH_FOUND=0
+	for _MBH_F in "${STATE_DIR}/"*.benchmark_history; do
+		[ -f "$_MBH_F" ] || continue
+		_MBH_FOUND=1
+		log_info "Migrating legacy benchmark history: ${_MBH_F} -> ${_MBH_NEW}"
+		cat "$_MBH_F" >> "$_MBH_NEW" 2>/dev/null
+		rm -f "$_MBH_F"
+	done
+	if [ "$_MBH_FOUND" = "1" ]; then
+		_MBH_TMP=$(mktemp /tmp/wgbenchmig.XXXXXX)
+		sort -t'|' -k1,1n "$_MBH_NEW" > "$_MBH_TMP" 2>/dev/null \
+			&& mv "$_MBH_TMP" "$_MBH_NEW" \
+			|| rm -f "$_MBH_TMP"
+		log_info "Benchmark history migration complete"
+	fi
+	touch "$_MBH_DONE"
 }
 
 # Returns benchmark URL for tunnel index, with per-tunnel override support.
@@ -2571,6 +2946,7 @@ run_tunnel_benchmark() {
 	_RB_RC=1
 	_RB_METHOD=''
 
+	log_info "Benchmark '${_RB_LABEL}': testing peer '${_RB_ACTIVE_NAME}'..."
 	if [ -n "$_RB_RT" ]; then
 		log_verbose "Benchmark '${_RB_LABEL}': attempting via route table ${_RB_RT}"
 		ip route exec table "$_RB_RT" curl -L --max-time "${BENCHMARK_TIMEOUT:-30}" \
@@ -2595,8 +2971,15 @@ run_tunnel_benchmark() {
 	rm -f "$_RB_CURL_OUT"
 	rm -f "$_RB_CURL_ERR"
 
-	if [ "$_RB_RC" -ne 0 ] || [ -z "$_RB_METRICS" ]; then
-		log_warn "Benchmark '${_RB_LABEL}': FAILED (peer '${_RB_ACTIVE_NAME}', method ${_RB_METHOD:-unknown}, rc=${_RB_RC})"
+	if [ -z "$_RB_METRICS" ]; then
+		log_fail "Benchmark '${_RB_LABEL}': peer '${_RB_ACTIVE_NAME}' failed (method ${_RB_METHOD:-unknown}, rc=${_RB_RC})"
+		[ -n "$_RB_ERR" ] && log_verbose "Benchmark '${_RB_LABEL}': curl error: $_RB_ERR"
+		record_benchmark_history "$_RB_IFACE" "$_RB_LABEL" "$_RB_ACTIVE_NAME" "$_RB_URL" "fail" "0.00" "0" "0.00"
+		return 1
+	fi
+
+	if [ "$_RB_RC" -ne 0 ] && [ "$_RB_RC" -ne 28 ]; then
+		log_fail "Benchmark '${_RB_LABEL}': peer '${_RB_ACTIVE_NAME}' failed (method ${_RB_METHOD:-unknown}, rc=${_RB_RC})"
 		[ -n "$_RB_ERR" ] && log_verbose "Benchmark '${_RB_LABEL}': curl error: $_RB_ERR"
 		record_benchmark_history "$_RB_IFACE" "$_RB_LABEL" "$_RB_ACTIVE_NAME" "$_RB_URL" "fail" "0.00" "0" "0.00"
 		return 1
@@ -2607,6 +2990,28 @@ run_tunnel_benchmark() {
 	_RB_SECS=$(printf '%s' "$_RB_METRICS" | cut -d'|' -f3)
 	_RB_Mbps=$(awk -v s="${_RB_SPEED:-0}" 'BEGIN { printf "%.2f", (s*8)/1000000 }')
 
+	_RB_BYTES_INT=$(printf '%s' "${_RB_BYTES:-0}" | cut -d'.' -f1 | tr -cd '0-9')
+	_RB_BYTES_INT="${_RB_BYTES_INT:-0}"
+	_RB_SECS_INT=$(printf '%s' "${_RB_SECS:-0}" | cut -d'.' -f1 | tr -cd '0-9')
+	_RB_SECS_INT="${_RB_SECS_INT:-0}"
+
+	# Minimum bytes = what 0.5 Mbps would deliver in the elapsed time, floored at 256KB.
+	# This catches early disconnects (short time + tiny bytes) without penalising
+	# genuinely slow peers that ran for the full timeout duration.
+	_RB_MIN_BYTES=$(awk -v t="$_RB_SECS_INT" 'BEGIN { m = int(t * 62500); if (m < 262144) m = 262144; printf "%d", m }')
+
+	log_verbose "Benchmark '${_RB_LABEL}': peer '${_RB_ACTIVE_NAME}' received ${_RB_BYTES_INT} bytes in ${_RB_SECS_INT}s (minimum: ${_RB_MIN_BYTES} bytes)"
+
+	if [ "$_RB_BYTES_INT" -lt "$_RB_MIN_BYTES" ] 2>/dev/null; then
+		log_fail "Benchmark '${_RB_LABEL}': peer '${_RB_ACTIVE_NAME}' download too small (${_RB_BYTES_INT} bytes in ${_RB_SECS_INT}s, minimum ${_RB_MIN_BYTES} bytes) -- treating as fail"
+		record_benchmark_history "$_RB_IFACE" "$_RB_LABEL" "$_RB_ACTIVE_NAME" "$_RB_URL" "fail" "0.00" "$_RB_BYTES_INT" "${_RB_SECS:-0}"
+		return 1
+	fi
+
+	if [ "$_RB_RC" -eq 28 ]; then
+		log_verbose "Benchmark '${_RB_LABEL}': timeout reached but sufficient data received -- using available metrics"
+	fi
+
 	case "$_RB_METHOD" in
 		route_table:*)
 			_RB_METHOD_MSG="route table ${_RB_METHOD#route_table:}" ;;
@@ -2616,9 +3021,188 @@ run_tunnel_benchmark() {
 			_RB_METHOD_MSG="${_RB_METHOD:-unknown}" ;;
 	esac
 	log_verbose "Benchmark '${_RB_LABEL}': download complete via ${_RB_METHOD_MSG}"
-	log_info "Benchmark '${_RB_LABEL}': ${_RB_Mbps} Mbps (peer '${_RB_ACTIVE_NAME}', ${_RB_BYTES:-0} bytes in ${_RB_SECS:-0}s, via ${_RB_METHOD_MSG})"
+	log_success "Benchmark '${_RB_LABEL}': ${_RB_Mbps} Mbps (peer '${_RB_ACTIVE_NAME}', ${_RB_BYTES:-0} bytes in ${_RB_SECS:-0}s, via ${_RB_METHOD_MSG})"
 	record_benchmark_history "$_RB_IFACE" "$_RB_LABEL" "$_RB_ACTIVE_NAME" "$_RB_URL" "ok" "$_RB_Mbps" "${_RB_BYTES:-0}" "${_RB_SECS:-0}"
+	[ -n "$BENCHMARK_RESULT_FILE" ] && printf '%s' "$_RB_Mbps" > "$BENCHMARK_RESULT_FILE"
 	return 0
+}
+
+# Cycles through every peer in the pool for a tunnel, benchmarks each one,
+# then returns to the original peer.
+# Results are appended to _BS_RESULTS_FILE (one line per peer: PEER_NAME|result|mbps).
+# Arguments: RESULTS_FILE IFACE WG_IF LABEL ROUTE_TABLE URL POOL...
+run_full_benchmark_sweep() {
+	_BS_RESULTS_FILE=$1
+	_BS_IFACE=$2
+	_BS_WG_IF=$3
+	_BS_LABEL=$4
+	_BS_RT=$5
+	_BS_URL=$6
+	shift 6
+	_BS_POOL="$*"
+
+	_BS_ORIGINAL_PEER=$(get_active_peer "$_BS_IFACE")
+	_BS_ORIGINAL_NAME=$(get_peer_name "$_BS_ORIGINAL_PEER")
+
+	log_info "Benchmark sweep '${_BS_LABEL}': starting -- ${_BS_ORIGINAL_NAME} is active, will visit all peers"
+
+	# Helper: run benchmark and capture result line into results file
+	_sweep_bench() {
+		_SB_PEER_NAME=$1
+		_SB_TMPRESULT=$(mktemp /tmp/wgbenchmbs.XXXXXX)
+		BENCHMARK_RESULT_FILE="$_SB_TMPRESULT" \
+			run_tunnel_benchmark "$_BS_IFACE" "$_BS_WG_IF" "$_BS_LABEL" "$_BS_RT" "$_BS_URL"
+		_SB_RC=$?
+		_SB_MBPS=$(cat "$_SB_TMPRESULT" 2>/dev/null || echo '')
+		rm -f "$_SB_TMPRESULT"
+		if [ "$_SB_RC" = "0" ] && [ -n "$_SB_MBPS" ]; then
+			printf '%s|ok|%s\n' "$_SB_PEER_NAME" "$_SB_MBPS" >> "$_BS_RESULTS_FILE"
+		else
+			printf '%s|fail|—\n' "$_SB_PEER_NAME" >> "$_BS_RESULTS_FILE"
+		fi
+	}
+
+	# Benchmark the current (original) peer first
+	if [ "$DRY_RUN" = "1" ]; then
+		log_dryrun "Would benchmark current peer '${_BS_ORIGINAL_NAME}' via ${_BS_URL}"
+		printf '%s|dry-run|—\n' "$_BS_ORIGINAL_NAME" >> "$_BS_RESULTS_FILE"
+	else
+		_sweep_bench "$_BS_ORIGINAL_NAME"
+	fi
+
+	# Cycle through remaining peers
+	_BS_OTHERS=''
+	for _BS_PEER in $_BS_POOL; do
+		[ "$_BS_PEER" = "$_BS_ORIGINAL_PEER" ] && continue
+		_BS_OTHERS="$_BS_OTHERS $_BS_PEER"
+	done
+
+	for _BS_PEER in $_BS_OTHERS; do
+		_BS_PEER_NAME=$(get_peer_name "$_BS_PEER")
+
+		if [ "$DRY_RUN" = "1" ]; then
+			log_dryrun "Would switch to '${_BS_PEER_NAME}' and benchmark via ${_BS_URL}"
+			printf '%s|dry-run|—\n' "$_BS_PEER_NAME" >> "$_BS_RESULTS_FILE"
+			continue
+		fi
+
+		log_info "Benchmark sweep '${_BS_LABEL}': switching to '${_BS_PEER_NAME}' (method: uci, ping verify: skipped)"
+		if FLAG_SWITCH_METHOD='uci' switch_peer "$_BS_IFACE" "$_BS_WG_IF" "$_BS_PEER" "$_BS_ORIGINAL_NAME" "$_BS_RT" "benchmark-sweep"; then
+			_sweep_bench "$_BS_PEER_NAME"
+		else
+			log_warn "Benchmark sweep '${_BS_LABEL}': '${_BS_PEER_NAME}' failed switch -- skipping"
+			printf '%s|switch-fail|—\n' "$_BS_PEER_NAME" >> "$_BS_RESULTS_FILE"
+		fi
+	done
+
+	# Restore original peer
+	_BS_NOW_ACTIVE=$(get_active_peer "$_BS_IFACE")
+	if [ "$DRY_RUN" = "0" ] && [ "$_BS_NOW_ACTIVE" != "$_BS_ORIGINAL_PEER" ]; then
+		_BS_NOW_NAME=$(get_peer_name "$_BS_NOW_ACTIVE")
+		log_info "Benchmark sweep '${_BS_LABEL}': restoring '${_BS_ORIGINAL_NAME}' (method: uci, ping verify: skipped)"
+		if FLAG_SWITCH_METHOD='uci' switch_peer "$_BS_IFACE" "$_BS_WG_IF" "$_BS_ORIGINAL_PEER" "$_BS_NOW_NAME" "$_BS_RT" "benchmark-sweep-revert"; then
+			log_info "Benchmark sweep '${_BS_LABEL}': restored to '${_BS_ORIGINAL_NAME}'"
+		else
+			log_error "Benchmark sweep '${_BS_LABEL}': failed to restore '${_BS_ORIGINAL_NAME}' -- left on '${_BS_NOW_NAME}'"
+		fi
+	fi
+}
+
+# Runs a benchmark sweep across all tunnel peers combined, using a single tunnel.
+# Each peer is benchmarked using the URL configured for its own tunnel.
+# Args: RESULTS_FILE URL
+run_cross_tunnel_sweep() {
+	_CTS_RESULTS=$1
+	_CTS_URL=$2   # fallback only; per-peer URL resolved below
+
+	if ! resolve_sweep_tunnel; then
+		log_error "Cross-tunnel benchmark sweep: no usable tunnel found -- aborting"
+		return 1
+	fi
+
+	_CTS_POOL=$(get_all_tunnel_peers)
+	set -- $_CTS_POOL; _CTS_COUNT=$#
+
+	if [ "$_CTS_COUNT" = "0" ]; then
+		log_error "Cross-tunnel benchmark sweep: no peers found across any tunnel -- aborting"
+		return 1
+	fi
+
+	log_info "Cross-tunnel benchmark sweep: ${_CTS_COUNT} peers across all tunnels, using tunnel '${SWEEP_LABEL}' (${SWEEP_IFACE})"
+
+	_CTS_ORIGINAL_PEER=$(get_active_peer "$SWEEP_IFACE")
+	_CTS_ORIGINAL_NAME=$(get_peer_name "$_CTS_ORIGINAL_PEER")
+
+	# Helper: benchmark current peer on sweep tunnel, resolve URL from peer's home tunnel
+	_cts_bench() {
+		_CB_PEER=$1
+		_CB_PEER_NAME=$(get_peer_name "$_CB_PEER")
+		_CB_TIDX=$(get_tunnel_index_for_peer "$_CB_PEER")
+		if [ -n "$_CB_TIDX" ]; then
+			_CB_URL=$(get_benchmark_url_for_tunnel "$_CB_TIDX")
+		else
+			_CB_URL="$_CTS_URL"
+		fi
+		[ -z "$_CB_URL" ] && _CB_URL="$_CTS_URL"
+
+		log_verbose "Cross-tunnel benchmark sweep: peer '${_CB_PEER_NAME}' using test URL: ${_CB_URL}"
+
+		_CB_TMPRESULT=$(mktemp /tmp/wgbenchmbs.XXXXXX)
+		BENCHMARK_RESULT_FILE="$_CB_TMPRESULT" \
+			run_tunnel_benchmark "$SWEEP_IFACE" "$SWEEP_WG_IF" "$SWEEP_LABEL" "$SWEEP_RT" "$_CB_URL"
+		_CB_RC=$?
+		_CB_MBPS=$(cat "$_CB_TMPRESULT" 2>/dev/null || echo '')
+		rm -f "$_CB_TMPRESULT"
+		if [ "$_CB_RC" = "0" ] && [ -n "$_CB_MBPS" ]; then
+			printf '%s|ok|%s\n' "$_CB_PEER_NAME" "$_CB_MBPS" >> "$_CTS_RESULTS"
+		else
+			printf '%s|fail|—\n' "$_CB_PEER_NAME" >> "$_CTS_RESULTS"
+		fi
+	}
+
+	# Benchmark original peer first
+	if [ "$DRY_RUN" = "1" ]; then
+		_CTS_ORIG_TIDX=$(get_tunnel_index_for_peer "$_CTS_ORIGINAL_PEER")
+		_CTS_ORIG_URL=$([ -n "$_CTS_ORIG_TIDX" ] && get_benchmark_url_for_tunnel "$_CTS_ORIG_TIDX" || echo "$_CTS_URL")
+		log_dryrun "Would benchmark current peer '${_CTS_ORIGINAL_NAME}' via ${_CTS_ORIG_URL}"
+		printf '%s|dry-run|—\n' "$_CTS_ORIGINAL_NAME" >> "$_CTS_RESULTS"
+	else
+		_cts_bench "$_CTS_ORIGINAL_PEER"
+	fi
+
+	# Cycle through remaining peers
+	for _CTS_PEER in $_CTS_POOL; do
+		[ "$_CTS_PEER" = "$_CTS_ORIGINAL_PEER" ] && continue
+		_CTS_PEER_NAME=$(get_peer_name "$_CTS_PEER")
+
+		if [ "$DRY_RUN" = "1" ]; then
+			_CTS_TIDX=$(get_tunnel_index_for_peer "$_CTS_PEER")
+			_CTS_PEER_URL=$([ -n "$_CTS_TIDX" ] && get_benchmark_url_for_tunnel "$_CTS_TIDX" || echo "$_CTS_URL")
+			log_dryrun "Would switch to '${_CTS_PEER_NAME}' and benchmark via ${_CTS_PEER_URL}"
+			printf '%s|dry-run|—\n' "$_CTS_PEER_NAME" >> "$_CTS_RESULTS"
+			continue
+		fi
+
+		log_info "Cross-tunnel benchmark sweep: switching to '${_CTS_PEER_NAME}' (method: uci, ping verify: skipped)"
+		if FLAG_SWITCH_METHOD='uci' switch_peer "$SWEEP_IFACE" "$SWEEP_WG_IF" "$_CTS_PEER" "$_CTS_ORIGINAL_NAME" "$SWEEP_RT" "benchmark-sweep"; then
+			_cts_bench "$_CTS_PEER"
+		else
+			log_warn "Cross-tunnel benchmark sweep: '${_CTS_PEER_NAME}' failed switch -- skipping"
+			printf '%s|switch-fail|—\n' "$_CTS_PEER_NAME" >> "$_CTS_RESULTS"
+		fi
+	done
+
+	# Restore original peer
+	_CTS_NOW_ACTIVE=$(get_active_peer "$SWEEP_IFACE")
+	if [ "$DRY_RUN" = "0" ] && [ "$_CTS_NOW_ACTIVE" != "$_CTS_ORIGINAL_PEER" ]; then
+		_CTS_NOW_NAME=$(get_peer_name "$_CTS_NOW_ACTIVE")
+		log_info "Cross-tunnel benchmark sweep: restoring '${_CTS_ORIGINAL_NAME}' (method: uci, ping verify: skipped)"
+		if FLAG_SWITCH_METHOD='uci' switch_peer "$SWEEP_IFACE" "$SWEEP_WG_IF" "$_CTS_ORIGINAL_PEER" "$_CTS_NOW_NAME" "$SWEEP_RT" "benchmark-sweep-revert"; then
+			log_info "Cross-tunnel benchmark sweep: restored to '${_CTS_ORIGINAL_NAME}'"
+		else
+			log_error "Cross-tunnel benchmark sweep: failed to restore '${_CTS_ORIGINAL_NAME}' -- left on '${_CTS_NOW_NAME}'"
+		fi
+	fi
 }
 
 # Runs benchmark mode on matching tunnels without changing peers.
@@ -2634,60 +3218,167 @@ cmd_benchmark() {
 	else
 		echo "  Scope         : all enabled tunnels"
 	fi
+	if [ "$FLAG_BENCHMARK_ALL_PEERS" = "1" ]; then
+		echo "  Peers         : all peers per tunnel"
+	else
+		echo "  Peers         : active peer only"
+	fi
 	_BENCH_URL_DISPLAY=$(printf '%s' "${BENCHMARK_URL:-}" | sed 's/^ *//;s/ *$//;s/^`//;s/`$//;s/^"//;s/"$//;s/^'\''//;s/'\''$//')
 	echo "  Test file URL : ${_BENCH_URL_DISPLAY:-<unset>}"
+	[ "$FLAG_BENCHMARK_ALL_PEERS" = "1" ] && echo "  Mode          : ALL PEERS -- will cycle through each peer and return to original"
 	[ "$DRY_RUN" = "1" ] && echo "  Mode          : DRY RUN -- no network test executed"
 	echo "==============================================="
 	echo ""
 
-	TESTED=0
-	OK=0
-	FAIL=0
+	# Tmpfile accumulates: TUNNEL_LABEL|PEER_NAME|result|mbps
+	_CMD_B_RESULTS=$(mktemp /tmp/wgbenchresults.XXXXXX)
+
+	TUNNELS_TESTED=0
 	i=1
-	while [ "$i" -le "$TUNNEL_COUNT" ]; do
-		eval "_B_IFACE=\$TUNNEL_${i}_IFACE"
-		eval "_B_WG_IF=\$TUNNEL_${i}_WG_IF"
-		eval "_B_LABEL=\$TUNNEL_${i}_LABEL"
-		eval "_B_RT=\$TUNNEL_${i}_ROUTE_TABLE"
-		eval "_B_ENABLED=\$TUNNEL_${i}_FAILOVER_ENABLED"
 
-		tunnel_matches_target "$_B_LABEL" "$_B_IFACE" "$FLAG_BENCHMARK_LABEL" "$FLAG_BENCHMARK_IFACE"
-		_B_MATCH=$?
-		if [ "$_B_MATCH" = "1" ]; then
+	# Cross-tunnel all-peer sweep: one tunnel, all peers combined
+	if [ "$FLAG_BENCHMARK_ALL_PEERS" = "1" ] && \
+	   [ -z "$FLAG_BENCHMARK_LABEL" ] && [ -z "$FLAG_BENCHMARK_IFACE" ] && \
+	   [ -n "$BENCHMARK_SWEEP_TUNNEL" ]; then
+		_B_CROSS_RESULTS=$(mktemp /tmp/wgbenchcross.XXXXXX)
+		_B_CROSS_URL="${BENCHMARK_URL:-}"
+		run_cross_tunnel_sweep "$_B_CROSS_RESULTS" "$_B_CROSS_URL"
+		# Feed results into the main results file using sweep tunnel label
+		while IFS= read -r _BCR_LINE; do
+			[ -z "$_BCR_LINE" ] && continue
+			printf '%s|%s\n' "$SWEEP_LABEL" "$_BCR_LINE" >> "$_CMD_B_RESULTS"
+			TUNNELS_TESTED=$((TUNNELS_TESTED + 1))
+		done < "$_B_CROSS_RESULTS"
+		rm -f "$_B_CROSS_RESULTS"
+	else
+		while [ "$i" -le "$TUNNEL_COUNT" ]; do
+			load_tunnel_vars "$i"
+
+			tunnel_matches_target "$LABEL" "$IFACE" "$FLAG_BENCHMARK_LABEL" "$FLAG_BENCHMARK_IFACE"
+			[ $? = "1" ] && { i=$((i + 1)); continue; }
+
+			if [ "$ENABLED" != "1" ]; then
+				log_verbose "Benchmark '${LABEL}': auto-failover disabled -- skipping"
+				i=$((i + 1)); continue
+			fi
+
+			TUNNELS_TESTED=$((TUNNELS_TESTED + 1))
+			_B_URL=$(get_benchmark_url_for_tunnel "$i")
+
+			if [ "$FLAG_BENCHMARK_ALL_PEERS" = "1" ]; then
+				build_tunnel_pool "$i"
+
+				# Per-tunnel tmpfile for sweep results
+				_B_SWEEP_RESULTS=$(mktemp /tmp/wgbenchsweep.XXXXXX)
+
+				if [ "$POOL_COUNT" -lt 2 ]; then
+					log_warn "Benchmark sweep '${LABEL}': only 1 peer in pool -- running single benchmark"
+					_B_PEER_NAME=$(get_peer_name "$(get_active_peer "$IFACE")")
+					if [ "$DRY_RUN" = "1" ]; then
+						log_dryrun "Would benchmark '${_B_PEER_NAME}' via ${_B_URL}"
+						printf '%s|dry-run|—\n' "$_B_PEER_NAME" >> "$_B_SWEEP_RESULTS"
+					elif run_tunnel_benchmark "$IFACE" "$WG_IF" "$LABEL" "$ROUTE_TABLE" "$_B_URL"; then
+						printf '%s|ok|?\n' "$_B_PEER_NAME" >> "$_B_SWEEP_RESULTS"
+					else
+						printf '%s|fail|—\n' "$_B_PEER_NAME" >> "$_B_SWEEP_RESULTS"
+					fi
+				else
+					run_full_benchmark_sweep "$_B_SWEEP_RESULTS" \
+						"$IFACE" "$WG_IF" "$LABEL" "$ROUTE_TABLE" "$_B_URL" $POOL
+				fi
+
+				# Merge sweep results into main results file with tunnel label prefix
+				while IFS= read -r _BSR_LINE; do
+					[ -z "$_BSR_LINE" ] && continue
+					printf '%s|%s\n' "$LABEL" "$_BSR_LINE" >> "$_CMD_B_RESULTS"
+				done < "$_B_SWEEP_RESULTS"
+				rm -f "$_B_SWEEP_RESULTS"
+
+			else
+				# Single peer (active only)
+				_B_PEER_NAME=$(get_peer_name "$(get_active_peer "$IFACE")")
+				if [ "$DRY_RUN" = "1" ]; then
+					log_dryrun "Would benchmark tunnel '${LABEL}' (peer: ${_B_PEER_NAME}) using ${_B_URL}"
+					printf '%s|%s|dry-run|—\n' "$LABEL" "$_B_PEER_NAME" >> "$_CMD_B_RESULTS"
+				else
+					_B_SINGLE_TMPRESULT=$(mktemp /tmp/wgbenchmbs.XXXXXX)
+					BENCHMARK_RESULT_FILE="$_B_SINGLE_TMPRESULT" \
+						run_tunnel_benchmark "$IFACE" "$WG_IF" "$LABEL" "$ROUTE_TABLE" "$_B_URL"
+					_B_SINGLE_RC=$?
+					_B_SINGLE_MBPS=$(cat "$_B_SINGLE_TMPRESULT" 2>/dev/null || echo '')
+					rm -f "$_B_SINGLE_TMPRESULT"
+					if [ "$_B_SINGLE_RC" = "0" ] && [ -n "$_B_SINGLE_MBPS" ]; then
+						printf '%s|%s|ok|%s\n' "$LABEL" "$_B_PEER_NAME" "$_B_SINGLE_MBPS" >> "$_CMD_B_RESULTS"
+					else
+						printf '%s|%s|fail|—\n' "$LABEL" "$_B_PEER_NAME" >> "$_CMD_B_RESULTS"
+					fi
+				fi
+			fi
+
 			i=$((i + 1))
-			continue
-		fi
-		if [ "$_B_ENABLED" != "1" ]; then
-			log_verbose "Benchmark '${_B_LABEL}': auto-failover disabled -- skipping"
-			i=$((i + 1))
-			continue
-		fi
-
-		_B_URL=$(get_benchmark_url_for_tunnel "$i")
-		TESTED=$((TESTED + 1))
-		if [ "$DRY_RUN" = "1" ]; then
-			log_dryrun "Would benchmark tunnel '${_B_LABEL}' using ${_B_URL}"
-			OK=$((OK + 1))
-		elif run_tunnel_benchmark "$_B_IFACE" "$_B_WG_IF" "$_B_LABEL" "$_B_RT" "$_B_URL"; then
-			OK=$((OK + 1))
-		else
-			FAIL=$((FAIL + 1))
-		fi
-		i=$((i + 1))
-	done
-
-	if [ "$TESTED" = "0" ] && { [ -n "$FLAG_BENCHMARK_LABEL" ] || [ -n "$FLAG_BENCHMARK_IFACE" ]; }; then
-		if [ -n "$FLAG_BENCHMARK_IFACE" ]; then
-			echo "Warning: --benchmark --iface '${FLAG_BENCHMARK_IFACE}' did not match any enabled tunnel."
-		else
-			echo "Warning: --benchmark label '${FLAG_BENCHMARK_LABEL}' did not match any enabled tunnel."
-		fi
-		echo "Available tunnels:"
-		print_available_tunnels
+		done
 	fi
 
+	# ── Summary ──────────────────────────────────────────────────────────────
+	if [ "$TUNNELS_TESTED" = "0" ] && { [ -n "$FLAG_BENCHMARK_LABEL" ] || [ -n "$FLAG_BENCHMARK_IFACE" ]; }; then
+		warn_no_tunnel_match "benchmark" "0" "$FLAG_BENCHMARK_LABEL" "$FLAG_BENCHMARK_IFACE"
+		rm -f "$_CMD_B_RESULTS"
+		return
+	fi
+
+	TOTAL_OK=0
+	TOTAL_FAIL=0
+	TOTAL_SKIP=0
+	TOTAL_PEERS=0
+
 	echo ""
-	echo "Benchmark Summary: tested=${TESTED} ok=${OK} fail=${FAIL}"
+	echo "─────────────────────────────────────────────────"
+	echo "  Benchmark Summary"
+	echo "─────────────────────────────────────────────────"
+
+	_PREV_LABEL=''
+	while IFS='|' read -r _S_LABEL _S_PEER _S_RESULT _S_MBPS; do
+		[ -z "$_S_LABEL" ] && continue
+
+		# Print tunnel header when label changes
+		if [ "$_S_LABEL" != "$_PREV_LABEL" ]; then
+			[ -n "$_PREV_LABEL" ] && echo ""
+			printf "  Tunnel : %s\n" "$_S_LABEL"
+			_PREV_LABEL="$_S_LABEL"
+		fi
+
+		TOTAL_PEERS=$((TOTAL_PEERS + 1))
+		case "$_S_RESULT" in
+			ok)
+				TOTAL_OK=$((TOTAL_OK + 1))
+				printf "    %-30s  %-10s  %s Mbps\n" "$_S_PEER" "[  OK  ]" "$_S_MBPS"
+				;;
+			fail)
+				TOTAL_FAIL=$((TOTAL_FAIL + 1))
+				printf "    %-30s  %-10s\n" "$_S_PEER" "[ FAIL ]"
+				;;
+			switch-fail)
+				TOTAL_SKIP=$((TOTAL_SKIP + 1))
+				printf "    %-30s  %-10s\n" "$_S_PEER" "[ SKIP - no connect ]"
+				;;
+			dry-run)
+				printf "    %-30s  %-10s\n" "$_S_PEER" "[ DRY-RUN ]"
+				;;
+			*)
+				printf "    %-30s  %-10s\n" "$_S_PEER" "[ ? ]"
+				;;
+		esac
+	done < "$_CMD_B_RESULTS"
+
+	echo ""
+	echo "─────────────────────────────────────────────────"
+	printf "  Tunnels : %d    Peers : %d    OK : %d    FAIL : %d" \
+		"$TUNNELS_TESTED" "$TOTAL_PEERS" "$TOTAL_OK" "$TOTAL_FAIL"
+	[ "$TOTAL_SKIP" -gt 0 ] && printf "    skipped : %d" "$TOTAL_SKIP"
+	echo ""
+	echo "─────────────────────────────────────────────────"
+
+	rm -f "$_CMD_B_RESULTS"
 }
 
 # Builds a complete benchmark report for one tunnel.
@@ -2697,41 +3388,47 @@ cmd_benchmark() {
 build_benchmark_report_for_iface() {
 	_BR_IFACE=$1
 	_BR_NOW=$2
-	_BR_BFILE="${STATE_DIR}/${_BR_IFACE}.benchmark_history"
+	_BR_PEER_FILTER="${3:-}"   # optional space-separated peer name list
+	_BR_BFILE="${STATE_DIR}/benchmark_history"
 	_BR_TMP=$(mktemp /tmp/wgbenchreport.XXXXXX)
 
 	if [ -f "$_BR_BFILE" ]; then
-		awk -F'|' -v now="$_BR_NOW" '
+		awk -F'|' -v now="$_BR_NOW" -v filter="$_BR_PEER_FILTER" '
 			BEGIN {
 				c24 = now - 86400
-				c7 = now - 604800
+				c7  = now - 604800
 				c30 = now - 2592000
 				lastEpoch = 0
 				best30 = 0
 				worst30 = -1
+				# Build filter lookup table; empty filter = accept all
+				n = split(filter, fa, " ")
+				for (i = 1; i <= n; i++) fset[fa[i]] = 1
+				has_filter = (n > 0)
 			}
 			{
-				epoch = $1 + 0
-				peer = $3
-				host = $4
+				epoch  = $1 + 0
+				peer   = $3
+				host   = $4
 				result = $5
-				mbps = $6 + 0
+				mbps   = $6 + 0
+				if (has_filter && !(peer in fset)) next
 				if (epoch > lastEpoch) {
-					lastEpoch = epoch
-					lastPeer = peer
-					lastHost = host
+					lastEpoch  = epoch
+					lastPeer   = peer
+					lastHost   = host
 					lastResult = result
-					lastMbps = sprintf("%.2f", mbps)
+					lastMbps   = sprintf("%.2f", mbps)
 				}
 				if (epoch < c30) next
 				seen[peer] = 1
 				count30++
 				peerCount30[peer]++
 				if (epoch > peerLastEpoch[peer]) {
-					peerLastEpoch[peer] = epoch
-					peerLastHost[peer] = host
+					peerLastEpoch[peer]  = epoch
+					peerLastHost[peer]   = host
 					peerLastResult[peer] = result
-					peerLastMbps[peer] = sprintf("%.2f", mbps)
+					peerLastMbps[peer]   = sprintf("%.2f", mbps)
 				}
 				if (result == "ok") {
 					ok30++
@@ -2743,16 +3440,12 @@ build_benchmark_report_for_iface() {
 					if (mbps > peerBest30[peer]) peerBest30[peer] = mbps
 					if (!(peer in peerWorst30) || mbps < peerWorst30[peer]) peerWorst30[peer] = mbps
 					if (epoch >= c24) {
-						count24++
-						sum24 += mbps
-						peerCount24[peer]++
-						peerSum24[peer] += mbps
+						count24++; sum24 += mbps
+						peerCount24[peer]++; peerSum24[peer] += mbps
 					}
 					if (epoch >= c7) {
-						count7++
-						sum7 += mbps
-						peerCount7[peer]++
-						peerSum7[peer] += mbps
+						count7++; sum7 += mbps
+						peerCount7[peer]++; peerSum7[peer] += mbps
 					}
 				} else {
 					fail30++
@@ -2761,17 +3454,25 @@ build_benchmark_report_for_iface() {
 			}
 			END {
 				avg24 = (count24 > 0 ? sum24 / count24 : 0)
-				avg7 = (count7 > 0 ? sum7 / count7 : 0)
-				avg30 = (ok30 > 0 ? sum30 / ok30 : 0)
+				avg7  = (count7  > 0 ? sum7  / count7  : 0)
+				avg30 = (ok30    > 0 ? sum30 / ok30    : 0)
 				if (worst30 < 0) worst30 = 0
-				printf "T|%d|%s|%s|%s|%.2f|%d|%d|%d|%d|%d|%.2f|%.2f|%.2f|%.2f|%.2f\n", lastEpoch, lastPeer, lastHost, lastResult, (lastEpoch > 0 ? lastMbps + 0 : 0), count24 + 0, count7 + 0, count30 + 0, ok30 + 0, fail30 + 0, avg24, avg7, avg30, best30 + 0, worst30 + 0
+				printf "T|%d|%s|%s|%s|%.2f|%d|%d|%d|%d|%d|%.2f|%.2f|%.2f|%.2f|%.2f\n", \
+					lastEpoch, lastPeer, lastHost, lastResult, \
+					(lastEpoch > 0 ? lastMbps + 0 : 0), \
+					count24+0, count7+0, count30+0, ok30+0, fail30+0, \
+					avg24, avg7, avg30, best30+0, worst30+0
 				for (peer in seen) {
-					pavg24 = (peerCount24[peer] > 0 ? peerSum24[peer] / peerCount24[peer] : 0)
-					pavg7 = (peerCount7[peer] > 0 ? peerSum7[peer] / peerCount7[peer] : 0)
-					pavg30 = (peerOk30[peer] > 0 ? peerSum30[peer] / peerOk30[peer] : 0)
-					pbest30 = (peerBest30[peer] + 0)
+					pavg24  = (peerCount24[peer] > 0 ? peerSum24[peer]  / peerCount24[peer] : 0)
+					pavg7   = (peerCount7[peer]  > 0 ? peerSum7[peer]   / peerCount7[peer]  : 0)
+					pavg30  = (peerOk30[peer]    > 0 ? peerSum30[peer]  / peerOk30[peer]    : 0)
+					pbest30  = peerBest30[peer]  + 0
 					pworst30 = ((peer in peerWorst30) ? peerWorst30[peer] + 0 : 0)
-					printf "P|%s|%d|%s|%s|%.2f|%d|%d|%d|%d|%d|%.2f|%.2f|%.2f|%.2f|%.2f\n", peer, peerLastEpoch[peer] + 0, peerLastHost[peer], peerLastResult[peer], peerLastMbps[peer] + 0, peerCount24[peer] + 0, peerCount7[peer] + 0, peerCount30[peer] + 0, peerOk30[peer] + 0, peerFail30[peer] + 0, pavg24, pavg7, pavg30, pbest30, pworst30
+					printf "P|%s|%d|%s|%s|%.2f|%d|%d|%d|%d|%d|%.2f|%.2f|%.2f|%.2f|%.2f\n", \
+						peer, peerLastEpoch[peer]+0, peerLastHost[peer], peerLastResult[peer], \
+						peerLastMbps[peer]+0, peerCount24[peer]+0, peerCount7[peer]+0, \
+						peerCount30[peer]+0, peerOk30[peer]+0, peerFail30[peer]+0, \
+						pavg24, pavg7, pavg30, pbest30, pworst30
 				}
 			}
 		' "$_BR_BFILE" > "$_BR_TMP"
@@ -2786,7 +3487,9 @@ build_benchmark_report_for_iface() {
 	_BR_BEST_AVG=$(sed -n '2,$p' "$_BR_TMP" | sort -t'|' -k14,14nr -k9,9nr | awk -F'|' 'NR==1 { print $14; exit }')
 	[ -z "$_BR_BEST_AVG" ] && _BR_BEST_AVG='0'
 
-	sed -n '2,$p' "$_BR_TMP" | sort -t'|' -k14,14nr -k9,9nr | while IFS='|' read -r _P_TAG _P_PEER _P_LAST_EPOCH _P_HOST _P_LAST_RESULT _P_LAST_MBPS _P_COUNT24 _P_COUNT7 _P_COUNT30 _P_OK30 _P_FAIL30 _P_AVG24 _P_AVG7 _P_AVG30 _P_BEST30 _P_WORST30; do
+	sed -n '2,$p' "$_BR_TMP" | sort -t'|' -k14,14nr -k9,9nr | \
+	while IFS='|' read -r _P_TAG _P_PEER _P_LAST_EPOCH _P_HOST _P_LAST_RESULT _P_LAST_MBPS \
+		_P_COUNT24 _P_COUNT7 _P_COUNT30 _P_OK30 _P_FAIL30 _P_AVG24 _P_AVG7 _P_AVG30 _P_BEST30 _P_WORST30; do
 		_P_FAILOVERS30=0
 		if [ -n "$_BR_FAIL_MAP" ]; then
 			_P_FAILOVERS30=$(printf '%s\n' "$_BR_FAIL_MAP" | awk -F'|' -v peer="$_P_PEER" '$1 == peer { print $2; exit }')
@@ -2794,14 +3497,12 @@ build_benchmark_report_for_iface() {
 		fi
 		_P_STATE=$(benchmark_peer_state "$_P_LAST_RESULT" "$_P_COUNT30" "$_P_OK30" "$_P_AVG30" "$_BR_BEST_AVG")
 		printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-			"P" "$_P_STATE" "$_P_PEER" "$_P_LAST_EPOCH" "$_P_HOST" "$_P_LAST_RESULT" "$_P_LAST_MBPS" "$_P_COUNT24" "$_P_COUNT7" "$_P_COUNT30" "$_P_OK30" "$_P_FAIL30" "$_P_AVG24" "$_P_AVG7" "$_P_AVG30" "$_P_BEST30" "$_P_WORST30" "$_P_FAILOVERS30"
+			"P" "$_P_STATE" "$_P_PEER" "$_P_LAST_EPOCH" "$_P_HOST" "$_P_LAST_RESULT" "$_P_LAST_MBPS" \
+			"$_P_COUNT24" "$_P_COUNT7" "$_P_COUNT30" "$_P_OK30" "$_P_FAIL30" \
+			"$_P_AVG24" "$_P_AVG7" "$_P_AVG30" "$_P_BEST30" "$_P_WORST30" "$_P_FAILOVERS30"
 	done
 
 	rm -f "$_BR_TMP"
-}
-
-build_benchmark_summary_for_iface() {
-	printf '%s\n' "$(build_benchmark_report_for_iface "$1" "$2")" | sed -n '1p'
 }
 
 parse_benchmark_tunnel_summary() {
@@ -2822,8 +3523,10 @@ EOF
 	[ "${B_T_LAST_EPOCH:-0}" -gt 0 ] 2>/dev/null && [ "$_PBTS_NOW" -gt 0 ] 2>/dev/null && B_T_LAST_AGO=$(format_duration $(( _PBTS_NOW - B_T_LAST_EPOCH )))
 }
 
+# Args: tunnel_index now_epoch
 load_benchmark_tunnel_stats() {
-	parse_benchmark_tunnel_summary "$(build_benchmark_summary_for_iface "$1" "$2")" "$2"
+	parse_benchmark_tunnel_summary \
+		"$(get_benchmark_report_for_tunnel_index "$1" "$2" | sed -n '1p')" "$2"
 }
 
 parse_benchmark_peer_row() {
@@ -2895,8 +3598,19 @@ benchmark_peer_state() {
 	fi
 }
 
-build_benchmark_peer_rows_for_iface() {
-	printf '%s\n' "$(build_benchmark_report_for_iface "$1" "$2")" | sed -n '2,$p'
+# Builds a benchmark report for tunnel index $1 at timestamp $2,
+# automatically resolving the correct peer filter from the tunnel's keyword config.
+get_benchmark_report_for_tunnel_index() {
+	_GBRTI_IDX=$1
+	_GBRTI_NOW=$2
+	eval "_GBRTI_IFACE=\$TUNNEL_${_GBRTI_IDX}_IFACE"
+	_GBRTI_PEERS=$(get_peers_for_tunnel_index "$_GBRTI_IDX")
+	_GBRTI_PEER_NAMES=''
+	for _GBRTI_P in $_GBRTI_PEERS; do
+		_GBRTI_NAME=$(get_peer_name "$_GBRTI_P")
+		_GBRTI_PEER_NAMES="$_GBRTI_PEER_NAMES $_GBRTI_NAME"
+	done
+	build_benchmark_report_for_iface "$_GBRTI_IFACE" "$_GBRTI_NOW" "$_GBRTI_PEER_NAMES"
 }
 
 # Builds benchmark summary lines for plain or rich output.
@@ -2908,7 +3622,7 @@ _build_benchmark_lines() {
 		eval "_BBL_LABEL=\$TUNNEL_${_BBL_i}_LABEL"
 		_BBL_ACTIVE_ID=$(get_active_peer "$_BBL_IFACE")
 		_BBL_ACTIVE_NAME=$(get_peer_name "$_BBL_ACTIVE_ID")
-		_BBL_REPORT=$(build_benchmark_report_for_iface "$_BBL_IFACE" "$_BBL_NOW")
+		_BBL_REPORT=$(get_benchmark_report_for_tunnel_index "$_BBL_i" "$_BBL_NOW")
 		parse_benchmark_tunnel_summary "$(printf '%s\n' "$_BBL_REPORT" | sed -n '1p')" "$_BBL_NOW"
 		_BBL_AVG30_INT=$(awk -v x="${B_T_AVG30:-0}" 'BEGIN { printf "%.0f", x+0 }')
 		printf '%s: ~%s Mbps\n' "$_BBL_LABEL" "$_BBL_AVG30_INT"
@@ -2969,7 +3683,7 @@ cmd_benchmarks_internal_json() {
 	while [ "$_CBJ_i" -le "$TUNNEL_COUNT" ]; do
 		eval "_CBJ_IFACE=\$TUNNEL_${_CBJ_i}_IFACE"
 		eval "_CBJ_LABEL=\$TUNNEL_${_CBJ_i}_LABEL"
-		_CBJ_REPORT=$(build_benchmark_report_for_iface "$_CBJ_IFACE" "$_CBJ_NOW")
+		_CBJ_REPORT=$(get_benchmark_report_for_tunnel_index "$_CBJ_i" "$_CBJ_NOW")
 		parse_benchmark_tunnel_summary "$(printf '%s\n' "$_CBJ_REPORT" | sed -n '1p')" "$_CBJ_NOW"
 		[ "$_CBJ_FIRST" = "0" ] && printf ',\n'
 		_CBJ_FIRST=0
@@ -3047,7 +3761,7 @@ cmd_benchmarks() {
 	while [ "$_CB_i" -le "$TUNNEL_COUNT" ]; do
 		eval "_CB_IFACE=\$TUNNEL_${_CB_i}_IFACE"
 		eval "_CB_LABEL=\$TUNNEL_${_CB_i}_LABEL"
-		_CB_REPORT=$(build_benchmark_report_for_iface "$_CB_IFACE" "$_CB_NOW")
+		_CB_REPORT=$(get_benchmark_report_for_tunnel_index "$_CB_i" "$_CB_NOW")
 		parse_benchmark_tunnel_summary "$(printf '%s\n' "$_CB_REPORT" | sed -n '1p')" "$_CB_NOW"
 		echo ""
 		printf "  [%s] ${_C_CYAN}${_C_BOLD}%s${_C_RESET} ${_C_DIM}(%s)${_C_RESET}\n" "$_CB_i" "$_CB_LABEL" "$_CB_IFACE"
@@ -3146,7 +3860,7 @@ cleanup_stale_tunnel_states() {
 # --- Switch peer --------------------------------------------------------------
 # Switches a tunnel to a new peer, waits for handshake, then verifies routing.
 # Returns 0 on success, 1 on failure.
-# SWITCH_REASON: 'failover', 'rotation', 'exercise', 'exercise-revert', 'revert'
+# SWITCH_REASON: 'failover', 'rotation', 'exercise', 'exercise-revert', 'revert', 'benchmark-sweep', 'benchmark-sweep-revert'
 # Peer switch method is controlled by GLINET_SWITCH_METHOD (or --switch-method):
 #   auto — try GL.iNet API first; fall back to uci/ubus on API failure
 #   api  — GL.iNet API only; abort switch if API fails
@@ -3160,6 +3874,7 @@ switch_peer() {
 	ROUTE_TABLE=$5
 	SWITCH_REASON=${6:-failover}
 	NEW_NAME=$(get_peer_name "$NEW_PEER")
+	_SW_SWITCH_TS=$(date +%s)
 
 	# Resolve effective switch method: CLI flag overrides config
 	_SW_METHOD="${FLAG_SWITCH_METHOD:-$GLINET_SWITCH_METHOD}"
@@ -3202,7 +3917,7 @@ switch_peer() {
 				ubus call "network.interface.${IFACE}" up >/dev/null 2>&1
 
 				# Wait again after forced restart
-				if ! wait_for_handshake "$WG_IF"; then
+				if ! wait_for_handshake "$WG_IF" "$_SW_SWITCH_TS"; then
 					log_warn "Handshake still missing after bounce"
 					_SWITCH_FAILED=1
 				fi
@@ -3239,33 +3954,39 @@ switch_peer() {
 		}
 	fi
 
-	echo "$NEW_PEER" > "${STATE_DIR}/${IFACE}.active"
-
 	if [ "$PING_VERIFY" = "1" ]; then
 		log_info "Tunnel '${IFACE}': waiting for handshake with '${NEW_NAME}'..."
-		HANDSHAKE_RESULT=$(wait_for_handshake "$WG_IF")
+		HANDSHAKE_RESULT=$(wait_for_handshake "$WG_IF" "$_SW_SWITCH_TS")
 
 		if [ "$HANDSHAKE_RESULT" = "timeout" ]; then
 			log_warn "Tunnel '${IFACE}': handshake not seen within ${POST_SWITCH_HANDSHAKE_TIMEOUT}s — waiting ${POST_SWITCH_DELAY}s before pinging anyway"
 			sleep "$POST_SWITCH_DELAY"
 		else
-			log_info "Tunnel '${IFACE}': handshake established in ${HANDSHAKE_RESULT}s"
+			log_success "Tunnel '${IFACE}': handshake established in ${HANDSHAKE_RESULT}s"
 		fi
-		
+
 		log_verbose "Tunnel '${IFACE}': running ping verification (${PING_COUNT} pings to ${PING_TARGETS})"
 
 		if ping_through_tunnel "$WG_IF" "$ROUTE_TABLE"; then
-			log_change "Tunnel '${IFACE}': ping verification PASSED — '${NEW_NAME}' is working"
+			echo "$NEW_PEER" > "${STATE_DIR}/${IFACE}.active"
+			log_success "Tunnel '${IFACE}': ping verification PASSED — '${NEW_NAME}' is working"
 			record_switch_history "$IFACE" "$OLD_NAME" "$NEW_NAME" "$SWITCH_REASON" "ok"
 			return 0
 		else
-			log_error "Tunnel '${IFACE}': ping verification FAILED — '${NEW_NAME}' is not routing traffic"
+			log_fail "Tunnel '${IFACE}': ping verification FAILED — '${NEW_NAME}' is not routing traffic"
 			record_switch_history "$IFACE" "$OLD_NAME" "$NEW_NAME" "$SWITCH_REASON" "ping_failed"
 			set_peer_cooldown "$IFACE" "$NEW_PEER"
 			return 1
 		fi
 	else
-		log_verbose "Tunnel '${IFACE}': ping verification disabled — assuming '${NEW_NAME}' is OK"
+		log_verbose "Tunnel '${IFACE}': ping verification disabled — waiting for handshake only"
+		HANDSHAKE_RESULT=$(wait_for_handshake "$WG_IF" "$_SW_SWITCH_TS")
+		if [ "$HANDSHAKE_RESULT" = "timeout" ]; then
+			log_warn "Tunnel '${IFACE}': handshake not seen within ${POST_SWITCH_HANDSHAKE_TIMEOUT}s — continuing anyway"
+		else
+			log_verbose "Tunnel '${IFACE}': handshake established in ${HANDSHAKE_RESULT}s"
+		fi
+		echo "$NEW_PEER" > "${STATE_DIR}/${IFACE}.active"
 		record_switch_history "$IFACE" "$OLD_NAME" "$NEW_NAME" "$SWITCH_REASON" "ok_no_ping"
 		return 0
 	fi
@@ -3279,6 +4000,14 @@ get_next_available_peer() {
 	CURRENT=$2
 	shift 2
 	POOL="$*"
+
+	eval "_GNA_ORDER=\$TUNNEL_${_TUNNEL_IDX}_PEER_ORDER"
+	_GNA_ORDER="${_GNA_ORDER:-sequential}"
+
+	if [ "$_GNA_ORDER" = "random" ]; then
+		get_next_random_peer "$IFACE" "$CURRENT" $POOL
+		return
+	fi
 
 	AFTER=''
 	BEFORE=''
@@ -3308,6 +4037,119 @@ get_next_available_peer() {
 	done
 
 	echo ""
+}
+
+# Returns ordered peer list and next-peer info for a tunnel.
+# Usage: eval $(get_tunnel_order_info "$i")
+# Sets: ORDER_TYPE, ORDERED_NAMES, ACTIVE_INDEX, NEXT_PEER_NAME, NEXT_IS_RESHUF
+get_tunnel_order_info() {
+	_TOI_IDX=$1
+	load_tunnel_vars "$_TOI_IDX"
+	eval "_TOI_TYPE=\$TUNNEL_${_TOI_IDX}_PEER_ORDER"
+	_TOI_TYPE="${_TOI_TYPE:-sequential}"
+
+	# Get raw peer IDs in natural pool order
+	_TOI_POOL_IDS=$(get_peers_for_tunnel_index "$_TOI_IDX")
+	# Convert to names preserving order
+	_TOI_POOL_NAMES=""
+	for _TOI_PID in $_TOI_POOL_IDS; do
+		_TOI_PNAME=$(get_peer_name "$_TOI_PID")
+		_TOI_POOL_NAMES="$_TOI_POOL_NAMES $_TOI_PNAME"
+	done
+	_TOI_POOL_NAMES=$(printf '%s' "$_TOI_POOL_NAMES" | sed 's/^ //')
+
+	if [ "$_TOI_TYPE" = "random" ]; then
+		# Try to read persisted shuffle order (peer IDs) and current index
+		_TOI_ORDER_FILE="${STATE_DIR}/${IFACE}.peer_order"
+		_TOI_IDX_FILE="${STATE_DIR}/${IFACE}.peer_order_idx"
+		_TOI_SAVED_ORDER=$(cat "$_TOI_ORDER_FILE" 2>/dev/null || echo "")
+		_TOI_CURR_IDX=$(cat "$_TOI_IDX_FILE" 2>/dev/null || echo 0)
+
+		if [ -n "$_TOI_SAVED_ORDER" ]; then
+			# Convert saved peer IDs to names
+			_TOI_ORDERED_NAMES=""
+			for _TOI_PID in $_TOI_SAVED_ORDER; do
+				_TOI_PNAME=$(get_peer_name "$_TOI_PID")
+				_TOI_ORDERED_NAMES="$_TOI_ORDERED_NAMES $_TOI_PNAME"
+			done
+			_TOI_ORDERED_NAMES=$(printf '%s' "$_TOI_ORDERED_NAMES" | sed 's/^ //')
+		else
+			# No persisted order – generate a temporary shuffled order (for display only)
+			_TOI_ORDERED_NAMES=$(printf '%s\n' $_TOI_POOL_NAMES | awk '
+				BEGIN { srand() }
+				{ lines[NR] = $0 }
+				END {
+					n = NR
+					for (i = n; i > 1; i--) {
+						j = int(rand() * i) + 1
+						tmp = lines[i]; lines[i] = lines[j]; lines[j] = tmp
+					}
+					for (i = 1; i <= n; i++) print lines[i]
+				}
+			' | tr '\n' ' ' | sed 's/ $//')
+			_TOI_CURR_IDX=0
+		fi
+
+		_TOI_TOTAL=$(echo $_TOI_ORDERED_NAMES | wc -w)
+
+		_TOI_ACTIVE_PEER=$(get_active_peer "$IFACE")
+		_TOI_ACTIVE_NAME=$(get_peer_name "$_TOI_ACTIVE_PEER")
+
+		# Locate active peer's index in the ordered list (for highlighting)
+		_TOI_ACTIVE_INDEX=-1
+		_TOI_IDX_COUNTER=0
+		for _TOI_NAME in $_TOI_ORDERED_NAMES; do
+			if [ "$_TOI_NAME" = "$_TOI_ACTIVE_NAME" ]; then
+				_TOI_ACTIVE_INDEX=$_TOI_IDX_COUNTER
+				break
+			fi
+			_TOI_IDX_COUNTER=$((_TOI_IDX_COUNTER + 1))
+		done
+
+		# Determine next peer for status display using the real persisted index,
+		# not the active peer's position (which doesn't account for index drift)
+		if [ "$_TOI_CURR_IDX" -ge "$_TOI_TOTAL" ] 2>/dev/null; then
+			_TOI_NEXT_NAME=""
+			_TOI_NEXT_IS_RESHUF=1
+		else
+			_TOI_NEXT_NAME=$(printf '%s\n' $_TOI_ORDERED_NAMES | sed -n "$((_TOI_CURR_IDX + 1))p")
+			_TOI_NEXT_IS_RESHUF=$(( _TOI_CURR_IDX + 1 >= _TOI_TOTAL ? 1 : 0 ))
+		fi
+	else
+		# Sequential mode: order is natural pool order, next wraps around
+		_TOI_ORDERED_NAMES="$_TOI_POOL_NAMES"
+		_TOI_TOTAL=$(echo $_TOI_ORDERED_NAMES | wc -w)
+
+		_TOI_ACTIVE_PEER=$(get_active_peer "$IFACE")
+		_TOI_ACTIVE_NAME=$(get_peer_name "$_TOI_ACTIVE_PEER")
+
+		_TOI_ACTIVE_INDEX=-1
+		_TOI_IDX_COUNTER=0
+		for _TOI_NAME in $_TOI_ORDERED_NAMES; do
+			if [ "$_TOI_NAME" = "$_TOI_ACTIVE_NAME" ]; then
+				_TOI_ACTIVE_INDEX=$_TOI_IDX_COUNTER
+				break
+			fi
+			_TOI_IDX_COUNTER=$((_TOI_IDX_COUNTER + 1))
+		done
+
+		# Next peer: wrap around (active_index+1 mod total)
+		if [ "$_TOI_ACTIVE_INDEX" -ge 0 ]; then
+			_TOI_NEXT_IDX=$(( (_TOI_ACTIVE_INDEX + 1) % _TOI_TOTAL ))
+			_TOI_NEXT_NAME=$(printf '%s\n' $_TOI_ORDERED_NAMES | sed -n "$((_TOI_NEXT_IDX + 1))p")
+			_TOI_NEXT_IS_RESHUF=0
+		else
+			_TOI_NEXT_NAME=""
+			_TOI_NEXT_IS_RESHUF=0
+		fi
+	fi
+
+	# Output variables for eval
+	echo "ORDER_TYPE='$_TOI_TYPE'"
+	echo "ORDERED_NAMES='$_TOI_ORDERED_NAMES'"
+	echo "ACTIVE_INDEX=$_TOI_ACTIVE_INDEX"
+	echo "NEXT_PEER_NAME='$_TOI_NEXT_NAME'"
+	echo "NEXT_IS_RESHUF=$_TOI_NEXT_IS_RESHUF"
 }
 
 # =============================================================================
@@ -3433,12 +4275,7 @@ cmd_status() {
 		BLANK_KEYWORD_SEEN=0
 		i=1
 		while [ "$i" -le "$TUNNEL_COUNT" ]; do
-			eval "IFACE=\$TUNNEL_${i}_IFACE"
-			eval "WG_IF=\$TUNNEL_${i}_WG_IF"
-			eval "LABEL=\$TUNNEL_${i}_LABEL"
-			eval "KEYWORD=\$TUNNEL_${i}_KEYWORD"
-			eval "ROUTE_TABLE=\$TUNNEL_${i}_ROUTE_TABLE"
-			eval "ENABLED=\$TUNNEL_${i}_FAILOVER_ENABLED"
+			load_tunnel_vars "$i"
 			eval "ROTATE=\$TUNNEL_${i}_ROTATE"
 
 			printf "\n  ${_C_BOLD}[%s] %s${_C_RESET}  ${_C_DIM}(%s)${_C_RESET}\n" \
@@ -3464,20 +4301,15 @@ cmd_status() {
 			[ -z "$ACTIVE_ENDPOINT" ] && ACTIVE_ENDPOINT="no session"
 
 			if [ -z "$KEYWORD" ]; then
-				if [ "$BLANK_KEYWORD_SEEN" = "1" ]; then
-					status_row "Keyword" "$(badge_err '(blank) — SKIPPED: only one blank-keyword tunnel allowed')"
-					i=$((i + 1))
-					continue
-				fi
-				POOL=$(get_peers_excluding_other_keywords "$i")
 				KEYWORD_DESC="(blank — all unclaimed peers)"
-				BLANK_KEYWORD_SEEN=1
 			else
-				POOL=$(get_peers_for_keyword "$KEYWORD")
 				KEYWORD_DESC="'$KEYWORD'"
 			fi
 
-			set -- $POOL; POOL_COUNT=$#
+			if ! build_tunnel_pool "$i"; then
+				status_row "Keyword" "$(badge_err '(blank) — SKIPPED: only one blank-keyword tunnel allowed')"
+				i=$((i + 1)); continue
+			fi
 
 			POOL_AVAIL=0
 			ALT_AVAIL=0
@@ -3511,8 +4343,8 @@ cmd_status() {
 					HEALTH_STR="${HEALTH_STR}  ${_C_DIM}(${F24_COUNT} ${_F24_LABEL} in 24h)${_C_RESET}"
 				fi
 			fi
-			
-			# Drift warning — printed as its own prominent block
+
+			# Drift warning
 			STATE_PEER=$(cat "${STATE_DIR}/${IFACE}.active" 2>/dev/null || echo "")
 			if [ -n "$STATE_PEER" ] && [ "$STATE_PEER" != "$ACTIVE_PEER" ]; then
 				STATE_NAME=$(get_peer_name "$STATE_PEER")
@@ -3524,14 +4356,14 @@ cmd_status() {
 			status_row "Active peer" "${_C_CYAN}${_C_BOLD}${ACTIVE_NAME}${_C_RESET}  ${_C_DIM}(${ACTIVE_PEER})${_C_RESET}"
 			status_row "Endpoint" "$ACTIVE_ENDPOINT"
 			status_row "Handshake" "$HEALTH_STR"
-			load_benchmark_tunnel_stats "$IFACE" "$NOW_EPOCH"
+			load_benchmark_tunnel_stats "$i" "$NOW_EPOCH"
 			if [ "$B_T_LAST_TS" = "none" ]; then
 				status_row "Benchmark" "${_C_DIM}no benchmark history${_C_RESET}"
 			else
 				status_row "Benchmark" "${B_T_LAST_MBPS} Mbps  ${_C_DIM}(${B_T_LAST_RESULT}, ${B_T_LAST_AGO} ago, 24h avg: ${B_T_AVG24} Mbps)${_C_RESET}"
 			fi
 
-			# Peer pool
+			# Peer pool summary
 			POOL_SUMMARY="${POOL_COUNT} peers  ${_C_DIM}(ready: ${POOL_AVAIL}, alternates: ${ALT_AVAIL})${_C_RESET}"
 			if [ "$POOL_COUNT" -lt 1 ]; then
 				POOL_SUMMARY="${POOL_SUMMARY}  $(badge_err 'NO PEERS')"
@@ -3541,22 +4373,59 @@ cmd_status() {
 				POOL_SUMMARY="${POOL_SUMMARY}  $(badge_warn 'FAILOVER PAUSED')"
 			fi
 			printf "  ${_C_DIM}%-14s${_C_RESET} %b\n" "Peer pool" "$POOL_SUMMARY"
-			_FAILOVER_MAP=$(build_failover_peer_counts_for_iface "$IFACE" "$NOW_EPOCH")
-			for PEER in $POOL; do
-				PNAME=$(get_peer_name "$PEER")
-				PEER_FO_30D=$(printf '%s\n' "$_FAILOVER_MAP" | awk -F'|' -v peer="$PNAME" '$1 == peer { print $2; exit }')
+
+			# --- NEW: Peer order display (numbered, integrated) ---
+			eval $(get_tunnel_order_info "$i")
+			printf "  ${_C_DIM}%-14s${_C_RESET} %s\n" "Peer order" "$ORDER_TYPE"
+
+						# Print numbered list according to ORDERED_NAMES
+			_INDEX=1
+			for _PNAME in $ORDERED_NAMES; do
+				# Find peer ID for this name by scanning POOL
+				_PEER=""
+				for _P in $POOL; do
+					if [ "$(get_peer_name "$_P")" = "$_PNAME" ]; then
+						_PEER="$_P"
+						break
+					fi
+				done
+				[ -z "$_PEER" ] && _PEER="unknown"
+
+				# Get failover count for this peer (by name)
+				PEER_FO_30D=$(printf '%s\n' "$_FAILOVER_MAP" | awk -F'|' -v peer="$_PNAME" '$1 == peer { print $2; exit }')
 				[ -z "$PEER_FO_30D" ] && PEER_FO_30D=0
 				PEER_META="${_C_DIM}[30d failovers: ${PEER_FO_30D}]${_C_RESET}"
-				if [ "$PEER" = "$ACTIVE_PEER" ]; then
-					printf "    ${_C_CYAN}${_C_BOLD}►  %s  ${_C_DIM}(%s)${_C_RESET}  %b\n" "$PNAME" "$PEER" "$PEER_META"
-				elif peer_in_cooldown "$IFACE" "$PEER"; then
-					REMAINING=$(get_cooldown_remaining "$IFACE" "$PEER")
-					printf "    ${_C_AMBER}   %s  ${_C_DIM}(%s)${_C_RESET}${_C_AMBER}  [cooldown: %ss]${_C_RESET}  %b\n" \
-						"$PNAME" "$PEER" "$REMAINING" "$PEER_META"
+
+				# Check cooldown (by peer ID)
+				if peer_in_cooldown "$IFACE" "$_PEER"; then
+					REMAINING=$(get_cooldown_remaining "$IFACE" "$_PEER")
+					COOLDOWN_STR="${_C_AMBER}  [cooldown: ${REMAINING}s]${_C_RESET}"
 				else
-					printf "    ${_C_DIM}   %s  (%s)${_C_RESET}  %b\n" "$PNAME" "$PEER" "$PEER_META"
+					COOLDOWN_STR=""
 				fi
+
+				# Format the line
+				if [ "$_PNAME" = "$ACTIVE_NAME" ]; then
+					printf "    ${_C_BOLD}${_C_GREEN}%3d.  ► %s  ${_C_DIM}(%s)${_C_RESET}  %s %b\n" \
+						"$_INDEX" "$_PNAME" "$_PEER" "$COOLDOWN_STR" "$PEER_META"
+				else
+					printf "    ${_C_DIM}%3d.  %s  (%s)${_C_RESET}  %s %b\n" \
+						"$_INDEX" "$_PNAME" "$_PEER" "$COOLDOWN_STR" "$PEER_META"
+				fi
+
+				_INDEX=$((_INDEX + 1))
 			done
+
+			# Next peer line
+			if [ -z "$NEXT_PEER_NAME" ]; then
+				printf "  ${_C_DIM}%-14s${_C_RESET} ${_C_AMBER}New random order on next rotation/failover${_C_RESET}\n" "Next peer"
+			else
+				if [ "$NEXT_IS_RESHUF" = "1" ]; then
+					printf "  ${_C_DIM}%-14s${_C_RESET} %s ${_C_AMBER}(will reshuffle after this)${_C_RESET}\n" "Next peer" "$NEXT_PEER_NAME"
+				else
+					printf "  ${_C_DIM}%-14s${_C_RESET} %s\n" "Next peer" "$NEXT_PEER_NAME"
+				fi
+			fi
 
 			# Rotation
 			if [ -n "$ROTATE" ]; then
@@ -3734,7 +4603,7 @@ cmd_status() {
 		printf "\n${_C_DIM}  ──────────────────────────────────────────────${_C_RESET}\n\n"
 	fi
 
-	# --json output
+	# --json output (unchanged, already includes order_index in peers)
 	if [ "$STATUS_JSON" = "1" ]; then
 		_TS="$NOW_HUMAN"
 		_EPOCH="$NOW_EPOCH"
@@ -3745,7 +4614,6 @@ cmd_status() {
 
 		# --- WAN ---
 		printf '  "wan": {\n'
-
 		printf '    "iface": "%s",\n' "${_WAN_INFO_IFACE:-}"
 		printf '    "uptime_s": %s,\n' "${_WAN_INFO_UPTIME_SECS:-0}"
 		printf '    "check_targets": "%s",\n' "$WAN_PING_TARGETS"
@@ -3776,7 +4644,7 @@ cmd_status() {
 		printf '    "curl_rc": %s,\n'    "${GLINET_API_RC:-null}"
 		printf '    "salt": "%s",\n'     "${GLINET_API_SALT:-}"
 		printf '    "nonce": "%s",\n'    "${GLINET_API_NONCE:-}"
-		printf '    "hash": "%s",\n'      "${GLINET_API_HASH:-}"
+		printf '    "hash": "%s",\n'     "${GLINET_API_HASH:-}"
 		printf '    "login_ok": %s\n'     "${GLINET_API_LOGIN_OK:-false}"
 		printf '  },\n'
 
@@ -3835,8 +4703,7 @@ cmd_status() {
 				_J_ROT_NEXT_STR=$(schedule_next_due "$_J_ROTATE" "$_J_LAST_ROT")
 			fi
 
-			# Ping test through this tunnel (reuse background result if available,
-			# otherwise test inline — status already ran these above)
+			# Ping test
 			_J_PING_RESULT=null
 			if [ "$PING_VERIFY" = "1" ]; then
 				_J_PT=$(mktemp /tmp/wgjsonping.XXXXXX)
@@ -3845,6 +4712,9 @@ cmd_status() {
 				_J_PING_RESULT=$(cat "$_J_PT" 2>/dev/null || echo null)
 				rm -f "$_J_PT"
 			fi
+
+			# --- Peer order info for JSON ---
+			eval $(get_tunnel_order_info "$j")
 
 			printf '    {\n'
 			printf '      "label": "%s",\n'          "$_J_LABEL"
@@ -3865,9 +4735,11 @@ cmd_status() {
 				"$([ "$_J_LAST_ROT" -eq 0 ] && echo null || echo "$_J_LAST_ROT")"
 			printf '      "rotation_schedule": "%s",\n' "${_J_ROTATE:-}"
 			printf '      "rotation_next": "%s",\n'    "${_J_ROT_NEXT_STR:-}"
+			printf '      "peer_order_type": "%s",\n'  "$ORDER_TYPE"
+			printf '      "next_peer_in_order": "%s",\n' "$NEXT_PEER_NAME"
 			printf '      "peers": [\n'
 
-			# Build peer pool same way status does
+			# Build peer pool
 			if [ -z "$_J_KEYWORD" ]; then
 				_J_POOL=$(get_peers_excluding_other_keywords "$j")
 			else
@@ -3887,10 +4759,23 @@ cmd_status() {
 				fi
 				[ "$_PFIRST" = "0" ] && printf ',\n'
 				_PFIRST=0
+
+				# Determine order index for this peer
+				_ORD_IDX=-1
+				_CNT=0
+				for _OP in $ORDERED_NAMES; do
+					if [ "$_OP" = "$_JP_NAME" ]; then
+						_ORD_IDX=$_CNT
+						break
+					fi
+					_CNT=$((_CNT + 1))
+				done
+
 				printf '        {\n'
 				printf '          "id": "%s",\n'             "$_JP"
 				printf '          "name": "%s",\n'           "$_JP_NAME"
 				printf '          "active": %s,\n'           "$_JP_ACTIVE"
+				printf '          "order_index": %s,\n'      "$_ORD_IDX"
 				printf '          "in_cooldown": %s,\n'      "$_JP_COOLDOWN"
 				printf '          "cooldown_remaining_s": %s\n' "$_JP_COOLDOWN_REM"
 				printf '        }'
@@ -3901,14 +4786,14 @@ cmd_status() {
 		done
 		printf '\n  ],\n'
 
-		# --- Recent history (last 20 entries across all tunnels, chronological) ---
+		# --- Recent history ---
 		printf '  "recent_history": [\n'
 		_HALL=""
 		k=1
 		while [ "$k" -le "$TUNNEL_COUNT" ]; do
 			eval "_H_IFACE=\$TUNNEL_${k}_IFACE"
 			_HF="${STATE_DIR}/${_H_IFACE}.history"
-		   if [ -f "$_HF" ]; then
+			if [ -f "$_HF" ]; then
 				_HALL="${_HALL}$(sed "s/^/${_H_IFACE}|/" "$_HF")\n"
 			fi
 			k=$((k + 1))
@@ -3944,7 +4829,6 @@ cmd_status() {
 	fi
 }
 
-
 # =============================================================================
 # RESET subcommand
 # =============================================================================
@@ -3969,7 +4853,7 @@ cmd_reset() {
 		for _F in "${STATE_DIR}/"*; do
 			[ -f "$_F" ] || continue
 			case "$_F" in
-				*.history|*.benchmark_history) continue ;;
+				*.history|*/benchmark_history) continue ;;
 			esac
 			rm -f "$_F"
 		done
@@ -4114,31 +4998,12 @@ cmd_exercise() {
 
 	i=1
 	while [ "$i" -le "$TUNNEL_COUNT" ]; do
-		eval "IFACE=\$TUNNEL_${i}_IFACE"
-		eval "WG_IF=\$TUNNEL_${i}_WG_IF"
-		eval "LABEL=\$TUNNEL_${i}_LABEL"
-		eval "KEYWORD=\$TUNNEL_${i}_KEYWORD"
-		eval "ROUTE_TABLE=\$TUNNEL_${i}_ROUTE_TABLE"
-		eval "ENABLED=\$TUNNEL_${i}_FAILOVER_ENABLED"
+		load_tunnel_vars "$i"
 
 		tunnel_matches_target "$LABEL" "$IFACE" "$FLAG_EXERCISE_LABEL" "$FLAG_EXERCISE_IFACE"
-		_MATCH=$?
-		if [ "$_MATCH" = "1" ]; then
-			i=$((i + 1))
-			continue
-		fi
+		[ $? = "1" ] && { i=$((i + 1)); continue; }
 
-		if [ -z "$KEYWORD" ]; then
-			if [ "$BLANK_KEYWORD_SEEN" = "1" ]; then
-				test_warn "Tunnel '$LABEL': multiple blank-keyword tunnels -- skipping"
-				i=$((i + 1))
-				continue
-			fi
-			POOL=$(get_peers_excluding_other_keywords "$i")
-			BLANK_KEYWORD_SEEN=1
-		else
-			POOL=$(get_peers_for_keyword "$KEYWORD")
-		fi
+		build_tunnel_pool "$i" || { i=$((i + 1)); continue; }
 
 		run_exercise_tunnel "$IFACE" "$WG_IF" "$LABEL" "$ROUTE_TABLE" "$POOL"
 		TUNNELS_TESTED=$((TUNNELS_TESTED + 1))
@@ -4155,15 +5020,7 @@ cmd_exercise() {
 		echo "  Result         : ALL PASSED"
 	elif [ "$TUNNELS_TESTED" -eq 0 ]; then
 		echo "  Result         : NO TUNNELS TESTED"
-		if [ -n "$FLAG_EXERCISE_IFACE" ]; then
-			echo "  (No enabled tunnel found with iface '${FLAG_EXERCISE_IFACE}')"
-			echo "  Available tunnels:"
-			print_available_tunnels
-		elif [ -n "$FLAG_EXERCISE_LABEL" ]; then
-			echo "  (Label '${FLAG_EXERCISE_LABEL}' not found or not enabled)"
-			echo "  Available tunnels:"
-			print_available_tunnels
-		fi
+		warn_no_tunnel_match "exercise" "0" "$FLAG_EXERCISE_LABEL" "$FLAG_EXERCISE_IFACE"
 	else
 		echo "  Result         : FAILED ($TEST_FAIL check(s) did not pass)"
 	fi
@@ -4203,39 +5060,17 @@ cmd_force_rotate() {
 
 	i=1
 	while [ "$i" -le "$TUNNEL_COUNT" ]; do
-		eval "IFACE=\$TUNNEL_${i}_IFACE"
-		eval "WG_IF=\$TUNNEL_${i}_WG_IF"
-		eval "LABEL=\$TUNNEL_${i}_LABEL"
-		eval "KEYWORD=\$TUNNEL_${i}_KEYWORD"
-		eval "ROUTE_TABLE=\$TUNNEL_${i}_ROUTE_TABLE"
-		eval "ENABLED=\$TUNNEL_${i}_FAILOVER_ENABLED"
+		load_tunnel_vars "$i"
 
 		tunnel_matches_target "$LABEL" "$IFACE" "$FLAG_FORCE_ROTATE_LABEL" "$FLAG_FORCE_ROTATE_IFACE"
-		_MATCH=$?
-		if [ "$_MATCH" = "1" ]; then
-			i=$((i + 1))
-			continue
-		fi
+		[ $? = "1" ] && { i=$((i + 1)); continue; }
 
 		if ! is_tunnel_up "$IFACE"; then
 			log_warn "Tunnel '${LABEL}' (${IFACE}): interface is off -- skipping"
-			i=$((i + 1))
-			continue
+			i=$((i + 1)); continue
 		fi
 
-		if [ -z "$KEYWORD" ]; then
-			if [ "$BLANK_KEYWORD_SEEN" = "1" ]; then
-				log_error "Tunnel '${LABEL}': multiple blank-keyword tunnels -- only one allowed, skipping"
-				i=$((i + 1))
-				continue
-			fi
-			POOL=$(get_peers_excluding_other_keywords "$i")
-			BLANK_KEYWORD_SEEN=1
-		else
-			POOL=$(get_peers_for_keyword "$KEYWORD")
-		fi
-
-		set -- $POOL; POOL_COUNT=$#
+		build_tunnel_pool "$i" || { i=$((i + 1)); continue; }
 		if [ "$POOL_COUNT" -lt 2 ]; then
 			log_warn "Tunnel '${LABEL}' (${IFACE}): only 1 peer in pool -- cannot rotate"
 			i=$((i + 1))
@@ -4245,6 +5080,7 @@ cmd_force_rotate() {
 		ACTIVE_PEER=$(get_active_peer "$IFACE")
 		ACTIVE_NAME=$(get_peer_name "$ACTIVE_PEER")
 
+		_TUNNEL_IDX=$i
 		NEXT_PEER=$(get_next_rotation_peer "$IFACE" "$ACTIVE_PEER" $POOL)
 
 		if [ -z "$NEXT_PEER" ]; then
@@ -4255,10 +5091,10 @@ cmd_force_rotate() {
 			if switch_peer "$IFACE" "$WG_IF" "$NEXT_PEER" "$ACTIVE_NAME" "$ROUTE_TABLE" "force-rotate"; then
 				set_last_rotate "$IFACE"
 				send_webhook "$LABEL" "$ACTIVE_NAME" "$NEXT_NAME" "rotated_manual"
-				log_info "Tunnel '${LABEL}': force-rotate complete -- now on '${NEXT_NAME}'"
+				log_success "Tunnel '${LABEL}': force-rotate complete -- now on '${NEXT_NAME}'"
 				ROTATED=$((ROTATED + 1))
 			else
-				log_error "Tunnel '${LABEL}': force-rotate to '${NEXT_NAME}' failed ping verification"
+				log_fail "Tunnel '${LABEL}': force-rotate to '${NEXT_NAME}' failed ping verification"
 				send_webhook "$LABEL" "$ACTIVE_NAME" "$NEXT_NAME" "ping_failed"
 			fi
 		fi
@@ -4267,17 +5103,7 @@ cmd_force_rotate() {
 	done
 
 	# Warn if a target was given but matched nothing
-	if [ "$ROTATED" = "0" ] && \
-	   { [ -n "$FLAG_FORCE_ROTATE_LABEL" ] || [ -n "$FLAG_FORCE_ROTATE_IFACE" ]; }; then
-		echo ""
-		if [ -n "$FLAG_FORCE_ROTATE_IFACE" ]; then
-			echo "Warning: --force-rotate --iface '${FLAG_FORCE_ROTATE_IFACE}' did not match any enabled tunnel."
-		else
-			echo "Warning: --force-rotate label '${FLAG_FORCE_ROTATE_LABEL}' did not match any enabled tunnel."
-		fi
-		echo "Available tunnels:"
-		print_available_tunnels
-	fi
+	warn_no_tunnel_match "force-rotate" "$ROTATED" "$FLAG_FORCE_ROTATE_LABEL" "$FLAG_FORCE_ROTATE_IFACE"
 }
 
 
@@ -4288,6 +5114,7 @@ cmd_force_rotate() {
 parse_args "$@"
 
 mkdir -p "$STATE_DIR"
+migrate_benchmark_history
 check_dependencies
 validate_config
 
@@ -4372,7 +5199,7 @@ cleanup_stale_tunnel_states
 # If --fail and --fail-wan are combined, simulate the WAN drop during the
 # tunnel handshake check, not here.
 if wan_is_stable || ( [ "$FLAG_FAIL" = "1" ] && [ "$FLAG_FAIL_WAN" = "1" ] ); then
-	log_info "WAN pre-flight: OK -- stable via ${_WAN_INFO_IFACE:-unknown}"
+	log_success "WAN pre-flight: OK -- stable via ${_WAN_INFO_IFACE:-unknown}"
 	[ "$FLAG_FAIL_WAN" = "0" ] && send_wan_webhook "up"
 else
 	# Distinguish actual outage from stability window not yet met
@@ -4382,7 +5209,7 @@ else
 		[ "$_WIS_REMAINING" -lt 0 ] && _WIS_REMAINING=0
 		log_warn "WAN pre-flight: reachable but not yet stable ($(format_duration "${_WIS_REMAINING:-0}") remaining) -- skipping tunnel checks"
 	else
-		log_warn "WAN pre-flight: FAILED -- no connectivity via ${_WAN_INFO_IFACE:-unknown}, skipping all tunnel checks"
+		log_fail "WAN pre-flight: FAILED -- no connectivity via ${_WAN_INFO_IFACE:-unknown}, skipping all tunnel checks"
 		send_wan_webhook "down"
 	fi
 	exit 0
@@ -4416,13 +5243,8 @@ FAIL_LABEL_MATCHED=0
 
 i=1
 while [ "$i" -le "$TUNNEL_COUNT" ]; do
-
-	eval "IFACE=\$TUNNEL_${i}_IFACE"
-	eval "WG_IF=\$TUNNEL_${i}_WG_IF"
-	eval "LABEL=\$TUNNEL_${i}_LABEL"
-	eval "KEYWORD=\$TUNNEL_${i}_KEYWORD"
-	eval "ROUTE_TABLE=\$TUNNEL_${i}_ROUTE_TABLE"
-	eval "ENABLED=\$TUNNEL_${i}_FAILOVER_ENABLED"
+	_TUNNEL_IDX=$i
+	load_tunnel_vars "$i"
 	eval "ROTATE=\$TUNNEL_${i}_ROTATE"
 
 	SIMULATE_THIS=0
@@ -4452,20 +5274,8 @@ while [ "$i" -le "$TUNNEL_COUNT" ]; do
 
 	send_tunnel_state_webhook "$IFACE" "$LABEL" "up"
 
-	if [ -z "$KEYWORD" ]; then
-		if [ "$BLANK_KEYWORD_SEEN" = "1" ]; then
-			log_error "Tunnel '${LABEL}': multiple blank-keyword tunnels -- only one allowed, skipping"
-			i=$((i + 1))
-			continue
-		fi
-		POOL=$(get_peers_excluding_other_keywords "$i")
-		log_verbose "Tunnel '${LABEL}': blank keyword -- using all unclaimed peers as pool"
-		BLANK_KEYWORD_SEEN=1
-	else
-		POOL=$(get_peers_for_keyword "$KEYWORD")
-	fi
-
-	set -- $POOL; POOL_COUNT=$#
+	[ -z "$KEYWORD" ] && log_verbose "Tunnel '${LABEL}': blank keyword -- using all unclaimed peers as pool"
+	build_tunnel_pool "$i" || { i=$((i + 1)); continue; }
 
 	if [ -z "$POOL" ]; then
 		if [ -z "$KEYWORD" ]; then
@@ -4508,9 +5318,9 @@ while [ "$i" -le "$TUNNEL_COUNT" ]; do
 			if switch_peer "$IFACE" "$WG_IF" "$NEXT_ROT_PEER" "$ACTIVE_NAME" "$ROUTE_TABLE" "rotation"; then
 				set_last_rotate "$IFACE"
 				send_webhook "$LABEL" "$ACTIVE_NAME" "$NEXT_ROT_NAME" "rotated_scheduled"
-				log_info "Tunnel '${LABEL}': rotation complete -- now on '${NEXT_ROT_NAME}'"
+				log_success "Tunnel '${LABEL}': rotation complete -- now on '${NEXT_ROT_NAME}'"
 			else
-				log_error "Tunnel '${LABEL}': rotation peer '${NEXT_ROT_NAME}' failed ping verification -- staying on '${ACTIVE_NAME}'"
+				log_fail "Tunnel '${LABEL}': rotation peer '${NEXT_ROT_NAME}' failed ping verification -- staying on '${ACTIVE_NAME}'"
 				send_webhook "$LABEL" "$ACTIVE_NAME" "$NEXT_ROT_NAME" "rotation_ping_failed"
 				# Still record a rotate timestamp so we don't immediately retry
 				set_last_rotate "$IFACE"
@@ -4534,7 +5344,7 @@ while [ "$i" -le "$TUNNEL_COUNT" ]; do
 
 	if [ "$AGE" -le "$HANDSHAKE_TIMEOUT" ]; then
 		rm -f "${STATE_DIR}/${IFACE}.cooldown.${ACTIVE_PEER}" 2>/dev/null
-		log_info "Tunnel '${LABEL}': OK -- '${ACTIVE_NAME}' (${AGE}s)"
+		log_success "Tunnel '${LABEL}': OK -- '${ACTIVE_NAME}' (${AGE}s)"
 		i=$((i + 1))
 		continue
 	fi
@@ -4613,10 +5423,10 @@ while [ "$i" -le "$TUNNEL_COUNT" ]; do
 			SWITCHED_TO_PEER="$NEXT_PEER"
 			SWITCHED_TO_NAME="$NEXT_NAME"
 			send_webhook "$LABEL" "$ACTIVE_NAME" "$NEXT_NAME" "switched_failover"
-			log_info "Tunnel '${LABEL}': failover complete -- now on '${NEXT_NAME}'"
+			log_success "Tunnel '${LABEL}': failover complete -- now on '${NEXT_NAME}'"
 			break
 		else
-			log_warn "Tunnel '${LABEL}': '${NEXT_NAME}' failed ping verification -- trying next peer"
+			log_fail "Tunnel '${LABEL}': '${NEXT_NAME}' failed ping verification -- trying next peer"
 			send_webhook "$LABEL" "$CURRENT_NAME" "$NEXT_NAME" "failover_ping_failed"
 			CURRENT_PEER="$NEXT_PEER"
 			CURRENT_NAME="$NEXT_NAME"
@@ -4631,9 +5441,9 @@ while [ "$i" -le "$TUNNEL_COUNT" ]; do
 			# Clear the cooldown we placed on the original peer if the failure was simulated
 			[ "$SIMULATE_THIS" = "1" ] && rm -f "${STATE_DIR}/${IFACE}.cooldown.${ACTIVE_PEER}" 2>/dev/null
 			send_webhook "$LABEL" "$SWITCHED_TO_NAME" "$ACTIVE_NAME" "switched_revert"
-			log_info "Tunnel '${LABEL}': reverted to '${ACTIVE_NAME}'"
+			log_success "Tunnel '${LABEL}': reverted to '${ACTIVE_NAME}'"
 		else
-			log_error "Tunnel '${LABEL}': revert to '${ACTIVE_NAME}' failed ping verification -- remaining on '${SWITCHED_TO_NAME}'"
+			log_fail "Tunnel '${LABEL}': revert to '${ACTIVE_NAME}' failed ping verification -- remaining on '${SWITCHED_TO_NAME}'"
 		fi
 	elif [ "$FLAG_REVERT" = "1" ] && [ -z "$SWITCHED_TO_PEER" ]; then
 		log_warn "Tunnel '${LABEL}': --revert requested but no switch occurred -- nothing to revert"
@@ -4644,16 +5454,9 @@ done
 
 # Warn if --fail was used but the target didn't match any tunnel
 if [ "$FLAG_FAIL" = "1" ] && [ "$FAIL_LABEL_MATCHED" = "0" ]; then
-	echo ""
-	if [ -n "$FLAG_FAIL_IFACE" ]; then
-		log_warn "No tunnel matched --fail --iface '${FLAG_FAIL_IFACE}'"
-		echo "Warning: --fail --iface '${FLAG_FAIL_IFACE}' did not match any tunnel."
-	else
-		log_warn "No tunnel matched --fail label '${FLAG_FAIL_LABEL}'"
-		echo "Warning: --fail label '${FLAG_FAIL_LABEL}' did not match any tunnel."
-	fi
-	echo "Available tunnels:"
-	print_available_tunnels
+	[ -n "$FLAG_FAIL_IFACE" ] && log_warn "No tunnel matched --fail --iface '${FLAG_FAIL_IFACE}'" \
+		|| log_warn "No tunnel matched --fail label '${FLAG_FAIL_LABEL}'"
+	warn_no_tunnel_match "fail" "$FAIL_LABEL_MATCHED" "$FLAG_FAIL_LABEL" "$FLAG_FAIL_IFACE"
 fi
 
 # Periodic status webhook
@@ -4673,20 +5476,23 @@ if [ -n "$BENCHMARK_INTERVAL" ] && [ -n "$BENCHMARK_URL" ] && \
 	_PBW_TS_FILE="${STATE_DIR}/benchmark_last_ts"
 	_PBW_LAST=$(cat "$_PBW_TS_FILE" 2>/dev/null || echo 0)
 	if schedule_due "benchmark" "$BENCHMARK_INTERVAL" "$_PBW_LAST"; then
-		log_verbose "Running periodic benchmark on current peers"
-		_BK_i=1
-		while [ "$_BK_i" -le "$TUNNEL_COUNT" ]; do
-			eval "_BK_IFACE=\$TUNNEL_${_BK_i}_IFACE"
-			eval "_BK_WG_IF=\$TUNNEL_${_BK_i}_WG_IF"
-			eval "_BK_LABEL=\$TUNNEL_${_BK_i}_LABEL"
-			eval "_BK_RT=\$TUNNEL_${_BK_i}_ROUTE_TABLE"
-			eval "_BK_ENABLED=\$TUNNEL_${_BK_i}_FAILOVER_ENABLED"
-			if [ "$_BK_ENABLED" = "1" ]; then
-				_BK_URL=$(get_benchmark_url_for_tunnel "$_BK_i")
-				[ -n "$_BK_URL" ] && run_tunnel_benchmark "$_BK_IFACE" "$_BK_WG_IF" "$_BK_LABEL" "$_BK_RT" "$_BK_URL"
-			fi
-			_BK_i=$(( _BK_i + 1 ))
-		done
+		log_verbose "Running periodic benchmark"
+		if [ "${BENCHMARK_INTERVAL_ALL_PEERS:-0}" = "1" ] && [ -n "$BENCHMARK_SWEEP_TUNNEL" ]; then
+			_PBK_CROSS_RESULTS=$(mktemp /tmp/wgbenchcross.XXXXXX)
+			run_cross_tunnel_sweep "$_PBK_CROSS_RESULTS" "${BENCHMARK_URL:-}"
+			rm -f "$_PBK_CROSS_RESULTS"
+		else
+			_BK_i=1
+			while [ "$_BK_i" -le "$TUNNEL_COUNT" ]; do
+				load_tunnel_vars "$_BK_i"
+				if [ "$ENABLED" = "1" ]; then
+					_BK_URL=$(get_benchmark_url_for_tunnel "$_BK_i")
+					[ -n "$_BK_URL" ] && run_tunnel_benchmark "$IFACE" "$WG_IF" "$LABEL" "$ROUTE_TABLE" "$_BK_URL"
+				fi
+				_BK_i=$(( _BK_i + 1 ))
+			done
+		fi
+
 		echo "$(date +%s)" > "$_PBW_TS_FILE"
 
 		_BIW="${BENCHMARK_INTERVAL_WEBHOOK:-0}"
